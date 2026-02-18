@@ -144,12 +144,16 @@ async def delete_user(
     user_id: str,
     admin: dict = Depends(require_admin),
 ):
-    """Remove a pharmacy user."""
+    """Remove a pharmacy user AND its linked pharmacy (bidirectional cascade)."""
     user = await db.get_pharmacy_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    await db.delete_pharmacy_user(user_id)
-    return {"message": "User deleted"}
+    pharmacy_id = user.get("pharmacy_id")
+    if pharmacy_id:
+        await db.delete_pharmacy(pharmacy_id)
+    else:
+        await db.delete_pharmacy_user(user_id)
+    return {"message": "User and associated pharmacy deleted"}
 
 
 # ---------------------------------------------------------------------------

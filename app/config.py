@@ -44,7 +44,7 @@ class Settings:
     # App
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
     API_VERSION: str = os.getenv("API_VERSION", "v1")
-    CORS_ORIGINS: list = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    CORS_ORIGINS: list = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8080,https://dashboardrerun.vercel.app").split(",")
 
 
 settings = Settings()
