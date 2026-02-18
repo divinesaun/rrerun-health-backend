@@ -2,15 +2,16 @@
 WhatsApp conversation orchestrator.
 
 Manages the full customer conversation flow:
-  - Medicine search
+  - Medicine search (ranked by: open now → price → distance → stock)
   - Pharmacy search (by name / area)
-  - Pharmacy details
+  - Pharmacy details with opening hours
   - Rating pharmacies
   - Prescription image handling
   - Menu / help
 """
 
 import json
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 from loguru import logger
@@ -21,145 +22,354 @@ from app.services.search_service import search_service
 from app.services.analytics_service import analytics_service
 from app.services.ocr_service import ocr_service
 
+# Zimbabwe is CAT (UTC+2)
+CAT = timezone(timedelta(hours=2))
 
-# ── Formatting helpers ──────────────────────────────────────────────────────
-
-def _stars(score: float) -> str:
-    full = int(score)
-    return "⭐" * full + ("½" if score - full >= 0.5 else "")
+DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
-def _fmt_pharmacy_line(idx: int, p: dict, price: str = None) -> str:
-    """Format a single pharmacy result line for WhatsApp."""
-    parts = [f"*{idx}. {p.get('name', 'Unknown')}*"]
-    if price is not None:
-        parts.append(f"   💰 ${price}")
-    rating = p.get("rating")
-    if rating:
-        parts.append(f"   {_stars(float(rating))} ({p.get('total_reviews', 0)} reviews)")
-    addr = p.get("address", "")
-    suburb = p.get("suburb", "")
-    if suburb:
-        addr = f"{addr}, {suburb}"
-    if addr:
-        parts.append(f"   📍 {addr}")
+# ── Opening hours helpers ─────────────────────────────────────────────────
+
+def _parse_opening_hours(raw) -> Optional[dict]:
+    """Parse opening_hours from JSONB (dict or JSON string) to a WeekSchedule dict."""
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and "mon" in parsed:
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
+def _is_pharmacy_open(hours_data: Optional[dict]) -> Optional[bool]:
+    """Check if pharmacy is currently open based on CAT time."""
+    if not hours_data:
+        return None
+    now = datetime.now(CAT)
+    day_key = list(DAY_MAP.keys())[now.weekday()]
+    day = hours_data.get(day_key)
+    if not day or not day.get("open"):
+        return False
+    try:
+        current = now.strftime("%H:%M")
+        return day.get("from", "00:00") <= current <= day.get("to", "23:59")
+    except Exception:
+        return None
+
+
+def _fmt_time_12h(t: str) -> str:
+    """Convert 24h time string to 12h format."""
+    try:
+        h, m = t.split(":")
+        hour = int(h)
+        ampm = "PM" if hour >= 12 else "AM"
+        h12 = 12 if hour == 0 else (hour - 12 if hour > 12 else hour)
+        return f"{h12}:{m}{ampm}"
+    except Exception:
+        return t
+
+
+def _fmt_opening_hours_short(hours_data: Optional[dict]) -> str:
+    """Format opening hours as a compact string for WhatsApp."""
+    if not hours_data:
+        return ""
+    groups = []
+    closed_days = []
+    for day_key, idx in DAY_MAP.items():
+        d = hours_data.get(day_key, {})
+        if not d.get("open"):
+            closed_days.append(DAY_LABELS[idx])
+            continue
+        frm, to = d.get("from", "08:00"), d.get("to", "17:00")
+        last = groups[-1] if groups else None
+        if last and last["from"] == frm and last["to"] == to:
+            last["days"].append(DAY_LABELS[idx])
+        else:
+            groups.append({"days": [DAY_LABELS[idx]], "from": frm, "to": to})
+
+    parts = []
+    for g in groups:
+        day_range = f"{g['days'][0]}-{g['days'][-1]}" if len(g["days"]) > 2 else ", ".join(g["days"])
+        parts.append(f"{day_range}: {_fmt_time_12h(g['from'])}-{_fmt_time_12h(g['to'])}")
+    if closed_days:
+        cd = f"{closed_days[0]}-{closed_days[-1]}" if len(closed_days) > 2 else ", ".join(closed_days)
+        parts.append(f"{cd}: Closed")
+    return " | ".join(parts)
+
+
+def _fmt_opening_hours_detail(hours_data: Optional[dict]) -> str:
+    """Format opening hours line-by-line for pharmacy detail view."""
+    if not hours_data:
+        return ""
+    lines = []
+    for day_key, idx in DAY_MAP.items():
+        d = hours_data.get(day_key, {})
+        label = DAY_LABELS[idx]
+        if d.get("open"):
+            lines.append(f"  {label}  {_fmt_time_12h(d.get('from', '08:00'))} - {_fmt_time_12h(d.get('to', '17:00'))}")
+        else:
+            lines.append(f"  {label}  Closed")
+    return "\n".join(lines)
+
+
+def _open_status_badge(hours_data: Optional[dict]) -> str:
+    """Return open/closed badge."""
+    is_open = _is_pharmacy_open(hours_data)
+    if is_open is True:
+        return "🟢 Open Now"
+    elif is_open is False:
+        # Find next opening time
+        if hours_data:
+            now = datetime.now(CAT)
+            keys = list(DAY_MAP.keys())
+            for offset in range(1, 8):
+                next_day = keys[(now.weekday() + offset) % 7]
+                d = hours_data.get(next_day, {})
+                if d.get("open"):
+                    return f"🔴 Closed (Opens {DAY_LABELS[(now.weekday() + offset) % 7]} {_fmt_time_12h(d.get('from', '08:00'))})"
+        return "🔴 Closed"
+    return ""
+
+
+def _stock_badge(in_stock, qty) -> str:
+    """Return stock status badge."""
+    if not in_stock:
+        return "❌ Out of Stock"
+    try:
+        q = int(qty) if qty else None
+    except (ValueError, TypeError):
+        q = None
+    if q is not None and q <= 5:
+        return f"⚠️ Limited Stock ({q} left)"
+    if q is not None:
+        return f"✅ In Stock ({q}+ available)"
+    return "✅ In Stock"
+
+
+def _payment_icons(p: dict) -> str:
+    """Build payment method icons from pharmacy data."""
+    methods = []
+    methods.append("💵 Cash")
+    if p.get("accepts_medical_aid"):
+        methods.append("💳 Medical Aid")
+    if p.get("has_delivery"):
+        methods.append("🚚 Delivery")
+    return ", ".join(methods) if methods else ""
+
+
+# ── Ranking helper ────────────────────────────────────────────────────────
+
+def _rank_pharmacy_results(results: list) -> list:
+    """
+    Rank pharmacies by priority:
+    1. Open Now (open first, closed last)
+    2. Price (lowest first)
+    3. Distance (if available)
+    4. Stock availability (in-stock first, limited next, out-of-stock last)
+    """
+    def sort_key(inv):
+        p = inv.get("pharmacies") or inv
+        hours_data = _parse_opening_hours(p.get("opening_hours"))
+        is_open = _is_pharmacy_open(hours_data)
+
+        # Priority 1: Open status (True=0, None=1, False=2)
+        open_score = 0 if is_open is True else (2 if is_open is False else 1)
+
+        # Priority 2: Price
+        try:
+            price = float(inv.get("price", 9999))
+        except (ValueError, TypeError):
+            price = 9999
+
+        # Priority 3: Distance
+        dist = p.get("distance_km") or 999
+
+        # Priority 4: Stock
+        in_stock = inv.get("in_stock", True)
+        try:
+            qty = int(inv.get("quantity_available", 0) or 0)
+        except (ValueError, TypeError):
+            qty = 0
+        stock_score = 0 if (in_stock and qty > 5) else (1 if in_stock else 2)
+
+        return (open_score, price, dist, stock_score)
+
+    return sorted(results, key=sort_key)
+
+
+# ── Message formatting ────────────────────────────────────────────────────
+
+def _fmt_pharmacy_line(idx: int, p: dict, inv: dict = None) -> str:
+    """Format a single pharmacy result line — professional WhatsApp layout."""
+    hours_data = _parse_opening_hours(p.get("opening_hours"))
+    status = _open_status_badge(hours_data)
+
+    lines = [f"{idx}. {status} *{p.get('name', 'Unknown')}*" if status else f"{idx}. *{p.get('name', 'Unknown')}*"]
+
+    details = []
+    if inv:
+        price = inv.get("price", "—")
+        in_stock = inv.get("in_stock", True)
+        qty = inv.get("quantity_available", "")
+        details.append(f"� ${price}")
+        details.append(_stock_badge(in_stock, qty))
+    if details:
+        lines.append(f"   {' | '.join(details)}")
+
+    # Location
+    loc_parts = []
     dist = p.get("distance_km")
     if dist is not None:
-        parts.append(f"   📏 {dist} km away")
+        loc_parts.append(f"{dist} km away")
+    addr = p.get("address", "")
+    suburb = p.get("suburb", "")
+    loc_str = ", ".join(filter(None, [addr, suburb]))
+    if loc_str:
+        loc_parts.append(loc_str)
+    if loc_parts:
+        lines.append(f"   📍 {' · '.join(loc_parts)}")
+
+    # Payment / services
+    pay = _payment_icons(p)
+    if pay:
+        lines.append(f"   {pay}")
+
+    # Phone
     phone = p.get("whatsapp_number") or p.get("phone")
     if phone:
-        parts.append(f"   📞 {phone}")
-    services = []
-    if p.get("has_delivery"):
-        services.append("🚚 Delivery")
-    if p.get("accepts_medical_aid"):
-        services.append("💳 Medical Aid")
-    if p.get("is_24_hours"):
-        services.append("🕐 24hrs")
-    if services:
-        parts.append(f"   {' · '.join(services)}")
-    return "\n".join(parts)
+        lines.append(f"   📞 {phone}")
+
+    return "\n".join(lines)
 
 
 def _fmt_pharmacy_detail(p: dict) -> str:
-    """Format a full pharmacy detail card."""
-    lines = [
-        f"🏥 *{p.get('name', 'Unknown')}*",
-        "",
-    ]
+    """Format a full pharmacy detail card — clean professional layout."""
+    hours_data = _parse_opening_hours(p.get("opening_hours"))
+    status = _open_status_badge(hours_data)
+
+    lines = [f"🏥 *{p.get('name', 'Unknown')}*"]
+    if status:
+        lines.append(status)
+    lines.append("")
+
+    # Rating
     rating = p.get("rating")
     if rating:
-        lines.append(f"⭐ Rating: {rating}/5 ({p.get('total_reviews', 0)} reviews)")
-    addr = p.get("address", "")
-    suburb = p.get("suburb", "")
-    city = p.get("city", "")
-    loc = ", ".join(filter(None, [addr, suburb, city]))
+        full = int(float(rating))
+        stars = "⭐" * full
+        lines.append(f"{stars} {rating}/5 ({p.get('total_reviews', 0)} reviews)")
+        lines.append("")
+
+    # Contact
+    lines.append("*Contact*")
+    loc = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", ""), p.get("city", "")]))
     if loc:
         lines.append(f"📍 {loc}")
     phone = p.get("phone")
     if phone:
-        lines.append(f"📞 Phone: {phone}")
+        lines.append(f"📞 {phone}")
     wa = p.get("whatsapp_number")
-    if wa:
-        lines.append(f"💬 WhatsApp: {wa}")
-    hours = p.get("opening_hours")
-    if hours:
-        lines.append(f"🕐 Hours: {hours}")
-
+    if wa and wa != phone:
+        lines.append(f"💬 {wa}")
     lines.append("")
-    lines.append("*Services:*")
+
+    # Opening Hours
+    if hours_data:
+        lines.append("*Opening Hours*")
+        lines.append(_fmt_opening_hours_detail(hours_data))
+        lines.append("")
+
+    # Services
+    services = []
     if p.get("accepts_medical_aid"):
-        lines.append("  ✅ Accepts Medical Aid")
+        services.append("💳 Accepts Medical Aid")
     if p.get("has_delivery"):
-        lines.append("  ✅ Delivery Service")
+        services.append("🚚 Delivery Available")
     if p.get("is_24_hours"):
-        lines.append("  ✅ Open 24 Hours")
+        services.append("🕐 Open 24 Hours")
     if p.get("parking_available"):
-        lines.append("  ✅ Parking Available")
+        services.append("🅿️ Parking Available")
     special = p.get("special_services")
     if special:
-        lines.append(f"  ℹ️ {special}")
+        services.append(f"ℹ️ {special}")
+    if services:
+        lines.append("*Services*")
+        for s in services:
+            lines.append(f"  {s}")
+        lines.append("")
 
     website = p.get("website")
     if website:
-        lines.append(f"\n🌐 {website}")
+        lines.append(f"🌐 {website}")
+        lines.append("")
 
-    lines.append("")
     lines.append("_Reply *rate [1-5]* to rate this pharmacy_")
     lines.append("_Reply *menu* to go back_")
     return "\n".join(lines)
 
 
 def _fmt_medicine_results(medicine_name: str, pharmacies: list) -> str:
-    """Format medicine search results."""
+    """Format medicine search results — ranked and professional."""
     if not pharmacies:
         return (
-            f"😔 Sorry, *{medicine_name}* is not currently in stock at any pharmacy.\n\n"
-            "💡 Try:\n"
-            "  • A different spelling\n"
-            "  • The generic name\n"
-            "  • Describing your symptoms\n\n"
+            f"� *{medicine_name}*\n"
+            "No results found.\n\n"
+            "Try a different spelling, the generic name, or describe your symptoms.\n\n"
             "_Reply *menu* for options_"
         )
 
+    ranked = _rank_pharmacy_results(pharmacies)
+    count = len(ranked)
+
     lines = [
-        f"💊 *{medicine_name}* — found at {len(pharmacies)} pharmacy{'s' if len(pharmacies) != 1 else ''}:\n"
+        f"💊 Found {count} pharmacy{'ies' if count != 1 else ''} with *{medicine_name}*:",
+        "",
     ]
-    for idx, inv in enumerate(pharmacies[:5], 1):
+    for idx, inv in enumerate(ranked[:5], 1):
         p = inv.get("pharmacies") or inv
-        price = inv.get("price", "—")
-        qty = inv.get("quantity_available", "")
-        stock_note = f" ({qty} available)" if qty else ""
-        line = _fmt_pharmacy_line(idx, p, price=f"{price}{stock_note}")
-        lines.append(line)
+        lines.append(_fmt_pharmacy_line(idx, p, inv=inv))
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("📌 Reply with a *number* (1-5) to see full pharmacy details")
-    lines.append("💊 Or send another medicine name to search")
-    lines.append("📋 Reply *menu* to see all options")
+    lines.append("Reply with a *number* for full details")
+    lines.append("Send another medicine name to search")
+    lines.append("_*menu* for all options_")
     return "\n".join(lines)
 
 
 MENU_TEXT = (
-    "🏥 *RERUN Health* — Your Pharmacy Assistant\n"
+    "💊 *RERUN Health*\n"
+    "Zimbabwe's Medicine Finder\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "Here's what I can do:\n\n"
-    "💊 *Search medicine* — just type a medicine name\n"
-    "   _e.g. \"paracetamol\" or \"headache medicine\"_\n\n"
-    "🏥 *Find pharmacy* — type \"pharmacy [name or area]\"\n"
-    "   _e.g. \"pharmacy Avondale\" or \"pharmacy Greenwood\"_\n\n"
-    "📸 *Prescription scan* — send a photo of your prescription\n\n"
-    "⭐ *Rate a pharmacy* — type \"rate [1-5]\" after viewing details\n\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "Just type what you need and I'll help! 😊"
+    "*Search Medicine*\n"
+    "Type a medicine name or symptom\n"
+    "_e.g. paracetamol, headache_\n\n"
+    "*Find Pharmacy*\n"
+    "Type: pharmacy [name or area]\n"
+    "_e.g. pharmacy Avondale_\n\n"
+    "*Scan Prescription*\n"
+    "Send a photo of your prescription\n\n"
+    "*Rate Pharmacy*\n"
+    "Type: rate [1-5] after viewing details\n"
+    "━━━━━━━━━━━━━━━━━━━━"
 )
 
 GREETING_TEXT = (
-    "👋 *Welcome to RERUN Health!*\n\n"
-    "I help you find medicines at pharmacies near you in Zimbabwe — "
-    "with prices, stock info, and ratings.\n\n"
-    + MENU_TEXT.split("Here's what I can do:\n\n", 1)[1]
+    "� *RERUN Health*\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Find medicines, compare prices, and locate pharmacies across Zimbabwe.\n\n"
+    "*How to use:*\n"
+    "• Type a medicine name to search\n"
+    "• Type *pharmacy [area]* to find nearby\n"
+    "• Send a prescription photo to scan\n"
+    "• Type *menu* anytime for options\n"
+    "━━━━━━━━━━━━━━━━━━━━"
 )
 
 

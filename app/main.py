@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
 
 from app.config import settings
@@ -9,6 +10,29 @@ from app import database as db
 from app.utils.security import hash_password
 
 from app.routers import whatsapp, customer, pharmacy, admin, medicines, auth
+
+ALLOWED_ORIGINS = settings.CORS_ORIGINS + ["https://dashboardrerun.vercel.app"]
+ALLOWED_ORIGINS = list(set(ALLOWED_ORIGINS))
+
+
+class CORSPreflight(BaseHTTPMiddleware):
+    """Catch OPTIONS preflight early — guarantees CORS headers on Vercel."""
+
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin", "")
+        if request.method == "OPTIONS":
+            resp = Response(status_code=200)
+            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Max-Age"] = "600"
+            return resp
+        response = await call_next(request)
+        if origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
 
 
 @asynccontextmanager
@@ -43,10 +67,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# Custom preflight handler — must be added FIRST (outermost middleware)
+app.add_middleware(CORSPreflight)
+
+# Standard CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
