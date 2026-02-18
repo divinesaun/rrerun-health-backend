@@ -8,6 +8,49 @@ from app import database as db
 
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
 
+# Map template names → twilio_service getter methods
+_TEMPLATE_MAP = {
+    "welcome": "get_welcome_template",
+    "menu": "get_menu_template",
+    "help": "get_help_template",
+    "results_nav": "get_results_nav_template",
+    "pharmacy_actions": "get_pharmacy_actions_template",
+    "rating": "get_rating_template",
+    "post_rating": "get_post_rating_template",
+}
+
+
+async def _send_action(to: str, action: dict) -> None:
+    """Dispatch a single message action to the appropriate Twilio method."""
+    action_type = action.get("type", "text")
+
+    if action_type == "text":
+        await twilio_service.send_message(to, action["body"])
+
+    elif action_type == "interactive":
+        template_name = action.get("template", "menu")
+        getter = _TEMPLATE_MAP.get(template_name)
+        if getter:
+            try:
+                content_sid = getattr(twilio_service, getter)()
+                await twilio_service.send_interactive(to, content_sid)
+            except Exception as e:
+                logger.warning(f"Interactive template '{template_name}' failed, falling back to text: {e}")
+                # Fallback: send the template body as plain text
+                await twilio_service.send_message(to, f"_Reply *menu* for options_")
+        else:
+            logger.warning(f"Unknown template '{template_name}', sending menu fallback")
+            await twilio_service.send_message(to, "_Reply *menu* for options_")
+
+    elif action_type == "location":
+        try:
+            await twilio_service.send_location(
+                to, action["lat"], action["lng"], action["label"], action.get("address", "")
+            )
+        except Exception as e:
+            logger.warning(f"Location send failed, falling back to text: {e}")
+            await twilio_service.send_message(to, f"📍 {action['label']}\n{action.get('address', '')}")
+
 
 @router.post("/whatsapp")
 async def handle_whatsapp_message(request: Request):
@@ -45,23 +88,26 @@ async def handle_whatsapp_message(request: Request):
             "content": message_body or "[image]",
         })
 
-        # 5. Process via WhatsApp service
-        response_text = await whatsapp_service.process_message(
+        # 5. Process via WhatsApp service — returns list of message actions
+        actions = await whatsapp_service.process_message(
             customer_id=customer_id,
             message=message_body,
             media_url=resolved_media,
             history=history,
         )
 
-        # 6. Save bot response
+        # 6. Build a text summary for conversation storage
+        text_parts = [a["body"] for a in actions if a.get("type") == "text"]
+        response_summary = "\n\n".join(text_parts) if text_parts else "[interactive message]"
         await db.save_conversation_message({
             "customer_id": customer_id,
             "role": "assistant",
-            "content": response_text,
+            "content": response_summary,
         })
 
-        # 7. Send reply via Twilio
-        await twilio_service.send_message(from_number, response_text)
+        # 7. Send each action via Twilio
+        for action in actions:
+            await _send_action(from_number, action)
 
         return {"status": "success"}
 
