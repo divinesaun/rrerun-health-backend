@@ -1,0 +1,17 @@
+{% extends "emails/base.html" %}
+{% block content %}
+  <p>Hi{% if customer_name %} <strong>{{ customer_name }}</strong>{% endif %},</p>
+  <p>{{ message }}</p>
+
+  {% if cta_text and cta_url %}
+  <p style="text-align:center;margin:28px 0;">
+    <a href="{{ cta_url }}"
+       style="background:#1a7f5e;color:#ffffff;padding:12px 32px;border-radius:6px;
+              text-decoration:none;font-weight:bold;font-size:15px;display:inline-block;">
+      {{ cta_text }}
+    </a>
+  </p>
+  {% endif %}
+
+  <p><strong>The RERUN Health Team</strong></p>
+{% endblock %}

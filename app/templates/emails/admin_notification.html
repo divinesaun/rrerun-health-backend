@@ -1,0 +1,19 @@
+{% extends "emails/base.html" %}
+{% block content %}
+  <p>Hi <strong>Admin</strong>,</p>
+  <p>{{ message }}</p>
+
+  {% if details %}
+  <table width="100%" cellpadding="8" cellspacing="0"
+         style="border-collapse:collapse;font-size:13px;margin:16px 0;">
+    {% for key, value in details.items() %}
+    <tr style="border-bottom:1px solid #eee;">
+      <td style="color:#888;width:40%;">{{ key }}</td>
+      <td style="color:#333;font-weight:bold;">{{ value }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  <p style="color:#777;font-size:13px;">This is an automated admin notification from RERUN Health.</p>
+{% endblock %}

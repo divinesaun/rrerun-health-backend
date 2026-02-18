@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+supabase
+python-dotenv
+python-jose[cryptography]
+bcrypt
+twilio
+requests
+Pillow
+pandas
+aiosmtplib
+jinja2
+httpx
+python-multipart
+loguru
+pytest
+pytest-asyncio
