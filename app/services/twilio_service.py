@@ -142,6 +142,45 @@ class TwilioService:
             }},
         )
 
+    async def send_cta(self, to: str, body: str, actions: list) -> dict:
+        """Send a call-to-action message with dynamic phone/URL buttons.
+        
+        actions: list of dicts with keys:
+          - title: str (button label, max 20 chars)
+          - type: "PHONE_NUMBER" or "URL"
+          - phone: str (for PHONE_NUMBER type)
+          - url: str (for URL type)
+        Max 2 actions per message.
+        """
+        to = self._to_wa(to)
+        # Build a unique name so we don't collide with other pharmacies
+        import hashlib
+        action_hash = hashlib.md5(json.dumps(actions, sort_keys=True).encode()).hexdigest()[:8]
+        friendly_name = f"rerun_cta_{action_hash}"
+
+        cta_actions = []
+        for i, a in enumerate(actions[:2]):
+            act = {"id": f"cta_{i}", "title": a["title"][:20], "type": a["type"]}
+            if a["type"] == "PHONE_NUMBER":
+                act["phone"] = a["phone"]
+            elif a["type"] == "URL":
+                act["url"] = a["url"]
+            cta_actions.append(act)
+
+        try:
+            content_sid = self._get_or_create_content(
+                friendly_name,
+                {"twilio/call-to-action": {"body": body, "actions": cta_actions}},
+            )
+            msg = self.client.messages.create(
+                content_sid=content_sid, from_=self.from_number, to=to,
+            )
+            logger.info(f"Sent CTA to {to}, SID: {msg.sid}")
+            return {"sid": msg.sid, "status": msg.status}
+        except Exception as e:
+            logger.error(f"Failed to send CTA to {to}: {e}")
+            raise
+
     def get_rating_template(self) -> str:
         """Get or create the rating quick-reply template."""
         return self._get_or_create_content(

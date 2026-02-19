@@ -51,6 +51,20 @@ async def _send_action(to: str, action: dict) -> None:
             logger.warning(f"Location send failed, falling back to text: {e}")
             await twilio_service.send_message(to, f"📍 {action['label']}\n{action.get('address', '')}")
 
+    elif action_type == "cta":
+        try:
+            await twilio_service.send_cta(to, action["body"], action["actions"])
+        except Exception as e:
+            logger.warning(f"CTA send failed, falling back to text: {e}")
+            # Fallback: show buttons as text links
+            lines = [action["body"]]
+            for a in action.get("actions", []):
+                if a["type"] == "PHONE_NUMBER":
+                    lines.append(f"📞 {a.get('phone', '')}")
+                elif a["type"] == "URL":
+                    lines.append(f"🗺️ {a.get('url', '')}")
+            await twilio_service.send_message(to, "\n".join(lines))
+
 
 @router.post("/whatsapp")
 async def handle_whatsapp_message(request: Request):

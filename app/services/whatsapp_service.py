@@ -46,6 +46,10 @@ def _location(lat: float, lng: float, label: str, address: str = "") -> dict:
     """Location message action."""
     return {"type": "location", "lat": lat, "lng": lng, "label": label, "address": address}
 
+def _cta(body: str, actions: list) -> dict:
+    """Call-to-action message action (phone/URL buttons)."""
+    return {"type": "cta", "body": body, "actions": actions}
+
 def _stars(score: int) -> str:
     """Return star emoji string for a rating score."""
     return "⭐" * score
@@ -527,10 +531,25 @@ class WhatsAppService:
         # Send location card if coordinates available
         lat = pharmacy.get("latitude")
         lng = pharmacy.get("longitude")
+        name = pharmacy.get("name", "Pharmacy")
         if lat and lng:
-            name = pharmacy.get("name", "Pharmacy")
             addr = ", ".join(filter(None, [pharmacy.get("address", ""), pharmacy.get("suburb", ""), pharmacy.get("city", "")]))
             actions.append(_location(float(lat), float(lng), name, addr))
+
+        # CTA buttons: Call + Directions (max 2 per message)
+        cta_actions = []
+        phone = pharmacy.get("phone") or pharmacy.get("whatsapp_number")
+        if phone:
+            # Normalize phone for call button (must be E.164)
+            p = phone.strip().replace(" ", "")
+            if not p.startswith("+"):
+                p = f"+263{p.lstrip('0')}"
+            cta_actions.append({"title": "📞 Call", "type": "PHONE_NUMBER", "phone": p})
+        if lat and lng:
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+            cta_actions.append({"title": "🗺️ Directions", "type": "URL", "url": maps_url})
+        if cta_actions:
+            actions.append(_cta(f"Contact {name}", cta_actions))
 
         actions.append(_interactive("pharmacy_actions"))
         return actions

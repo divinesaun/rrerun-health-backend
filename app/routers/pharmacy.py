@@ -233,11 +233,14 @@ async def update_pharmacy_profile(
     update_data = payload.model_dump(exclude_none=True)
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
-    # opening_hours is JSONB in DB — parse JSON string to dict if needed
-    if "opening_hours" in update_data and isinstance(update_data["opening_hours"], str):
-        try:
-            update_data["opening_hours"] = _json.loads(update_data["opening_hours"])
-        except (_json.JSONDecodeError, TypeError):
-            pass  # keep as-is if not valid JSON
+    # opening_hours is JSONB in DB — ensure it's a dict before saving
+    if "opening_hours" in update_data:
+        oh = update_data["opening_hours"]
+        if isinstance(oh, str):
+            try:
+                update_data["opening_hours"] = _json.loads(oh)
+            except (_json.JSONDecodeError, TypeError):
+                pass  # keep as-is if not valid JSON
+        # If it's already a dict, it's ready for JSONB storage
     pharmacy = await db.update_pharmacy(current_user["pharmacy_id"], update_data)
     return {"pharmacy": pharmacy}

@@ -61,9 +61,18 @@ async def update_pharmacy(
     admin: dict = Depends(require_admin),
 ):
     """Edit pharmacy details."""
+    import json as _json
     update_data = payload.model_dump(exclude_none=True)
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
+    # opening_hours is JSONB in DB — ensure it's a dict before saving
+    if "opening_hours" in update_data:
+        oh = update_data["opening_hours"]
+        if isinstance(oh, str):
+            try:
+                update_data["opening_hours"] = _json.loads(oh)
+            except (_json.JSONDecodeError, TypeError):
+                pass
     pharmacy = await db.update_pharmacy(pharmacy_id, update_data)
     if not pharmacy:
         raise HTTPException(status_code=404, detail="Pharmacy not found")

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional
+from typing import Optional, Union
 from datetime import datetime
 
 
@@ -10,7 +10,7 @@ class PharmacyBase(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     whatsapp_number: Optional[str] = None
-    opening_hours: Optional[str] = None
+    opening_hours: Optional[Union[str, dict]] = None
 
 
 class CreatePharmacyRequest(PharmacyBase):
@@ -26,7 +26,7 @@ class UpdatePharmacyRequest(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     whatsapp_number: Optional[str] = None
-    opening_hours: Optional[str] = None
+    opening_hours: Optional[Union[str, dict]] = None
     verified: Optional[bool] = None
 
 
@@ -81,7 +81,7 @@ class PharmacyProfileUpdate(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     whatsapp_number: Optional[str] = None
-    opening_hours: Optional[str] = None
+    opening_hours: Optional[Union[str, dict]] = None
     latitude: Optional[str] = None
     longitude: Optional[str] = None
     accepts_medical_aid: Optional[bool] = None
