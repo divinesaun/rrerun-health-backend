@@ -1,14 +1,19 @@
 """
 WhatsApp conversation orchestrator.
 
-Manages the full customer conversation flow with interactive messages:
-  - Welcome message + Quick Reply buttons
-  - Medicine search (ranked by: open now → price → distance → stock)
-  - Pharmacy search (by name / area)
-  - Pharmacy details with location card + CTA buttons
-  - Rating flow with quick reply buttons
-  - Prescription image handling
-  - Menu / help
+State machine flow:
+  STATE 1 — MAIN MENU (welcome, numbered options)
+  STATE 2 — MEDICINE SEARCH (plain name, symptom via LLM, image via OCR, bulk list)
+  STATE 3 — RESULTS LIST (ranked pharmacies with stock info)
+  STATE 4 — PHARMACY DETAIL (location pin + info card + CTA buttons)
+  STATE 5 — RATING (1-5, optional comment)
+
+Global rules:
+  - 0 / menu / home / back → main menu from any state
+  - help / ? → help message
+  - GPS location pin → save coords
+  - Max 2 messages per bot turn
+  - Every message ends with an italic next-step hint
 
 Response format: Each handler returns a list of message actions:
   [{"type": "text", "body": "..."}, {"type": "interactive", "template": "welcome"}, ...]
@@ -31,6 +36,8 @@ CAT = timezone(timedelta(hours=2))
 
 DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+RATING_LABELS = {1: "Poor", 2: "Below average", 3: "Average", 4: "Good", 5: "Excellent"}
 
 # ── Response builder helpers ─────────────────────────────────────────────
 
@@ -275,7 +282,7 @@ def _fmt_pharmacy_line(idx: int, p: dict, inv: dict = None) -> str:
 
 
 def _fmt_pharmacy_detail(p: dict) -> str:
-    """Format a full pharmacy detail card — clean professional layout."""
+    """Format a full pharmacy detail card — matches system prompt spec."""
     hours_data = _parse_opening_hours(p.get("opening_hours"))
     status = _open_status_badge(hours_data)
 
@@ -284,93 +291,168 @@ def _fmt_pharmacy_detail(p: dict) -> str:
         lines.append(status)
     lines.append("")
 
-    # Rating
-    rating = p.get("rating")
-    if rating:
-        full = int(float(rating))
-        stars = "⭐" * full
-        lines.append(f"{stars} {rating}/5 ({p.get('total_reviews', 0)} reviews)")
-        lines.append("")
-
-    # Contact
-    lines.append("*Contact*")
+    # Address + Maps link
     loc = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", ""), p.get("city", "")]))
     if loc:
-        lines.append(f"📍 {loc}")
+        lines.append("*📍 Address*")
+        lat, lng = p.get("latitude"), p.get("longitude")
+        if lat and lng:
+            lines.append(f"{loc}")
+            lines.append(f"🗺️ https://maps.google.com/?q={lat},{lng}")
+        else:
+            lines.append(loc)
+        lines.append("")
+
+    # Phone
     phone = p.get("phone")
     if phone:
-        lines.append(f"📞 {phone}")
-    wa = p.get("whatsapp_number")
-    if wa and wa != phone:
-        lines.append(f"💬 {wa}")
-    lines.append("")
+        lines.append(f"� {phone}")
+        lines.append("")
 
     # Opening Hours
     if hours_data:
-        lines.append("*Opening Hours*")
+        lines.append("*🕐 Hours*")
         lines.append(_fmt_opening_hours_detail(hours_data))
         lines.append("")
 
-    # Services
+    # Services — only show TRUE flags
     services = []
     if p.get("accepts_medical_aid"):
-        services.append("💳 Accepts Medical Aid")
-    if p.get("has_delivery"):
-        services.append("🚚 Delivery Available")
-    if p.get("is_24_hours"):
-        services.append("🕐 Open 24 Hours")
+        services.append("🏥 Accepts Medical Aid")
     if p.get("parking_available"):
-        services.append("🅿️ Parking Available")
+        services.append("� Parking Available")
+    if p.get("has_delivery"):
+        services.append("� Delivery Available")
+    if p.get("is_24_hours"):
+        services.append("� Open 24 Hours")
     special = p.get("special_services")
     if special:
         services.append(f"ℹ️ {special}")
     if services:
-        lines.append("*Services*")
+        lines.append("*ℹ️ Services*")
         for s in services:
-            lines.append(f"  {s}")
+            lines.append(s)
         lines.append("")
 
+    # Links — only show non-null
+    links = []
     website = p.get("website")
     if website:
-        lines.append(f"🌐 {website}")
+        links.append(f"🌐 {website}")
+    fb = p.get("facebook")
+    if fb:
+        links.append(f"📘 {fb}")
+    ig = p.get("instagram")
+    if ig:
+        links.append(f"📸 {ig}")
+    wa = p.get("whatsapp_number")
+    if wa:
+        wa_clean = wa.strip().replace(" ", "").replace("+", "")
+        links.append(f"💬 wa.me/{wa_clean}")
+    if links:
+        lines.append("*🌐 Links*")
+        for lnk in links:
+            lines.append(lnk)
         lines.append("")
 
-    lines.append("_Reply *rate [1-5]* to rate this pharmacy_")
-    lines.append("_Reply *menu* to go back_")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("Reply *rate* to rate · *save* to save · *back* for list")
+    lines.append("_Reply *0* for main menu_")
     return "\n".join(lines)
 
 
 def _fmt_medicine_results(medicine_name: str, pharmacies: list) -> str:
-    """Format medicine search results — ranked and professional."""
+    """Format medicine search results — ranked, grouped by open/closed."""
     if not pharmacies:
         return (
-            f"� *{medicine_name}*\n"
+            f"😔 *{medicine_name}*\n"
             "No results found.\n\n"
             "Try a different spelling, the generic name, or describe your symptoms.\n\n"
-            "_Reply *menu* for options_"
+            "_Reply *0* for main menu_"
         )
 
     ranked = _rank_pharmacy_results(pharmacies)
     count = len(ranked)
 
-    lines = [
-        f"💊 Found {count} pharmacy{'ies' if count != 1 else ''} with *{medicine_name}*:",
-        "",
-    ]
-    for idx, inv in enumerate(ranked[:5], 1):
+    # Group by open/closed
+    open_items = []
+    closed_items = []
+    for inv in ranked[:5]:
         p = inv.get("pharmacies") or inv
-        lines.append(_fmt_pharmacy_line(idx, p, inv=inv))
-        lines.append("")
+        hours_data = _parse_opening_hours(p.get("opening_hours"))
+        is_open = _is_pharmacy_open(hours_data)
+        if is_open is False:
+            closed_items.append(inv)
+        else:
+            open_items.append(inv)
+
+    lines = [f"💊 *{count} pharmacy{'ies' if count != 1 else ''}* with *{medicine_name}*\n"]
+
+    idx = 1
+    if open_items:
+        lines.append("🟢 *Open Now*")
+        for inv in open_items:
+            p = inv.get("pharmacies") or inv
+            lines.append(_fmt_pharmacy_line(idx, p, inv=inv))
+            lines.append("")
+            idx += 1
+
+    if closed_items:
+        lines.append("🔴 *Closed*")
+        for inv in closed_items:
+            p = inv.get("pharmacies") or inv
+            lines.append(_fmt_pharmacy_line(idx, p, inv=inv))
+            lines.append("")
+            idx += 1
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("Reply with a *number* for full details")
-    lines.append("Send another medicine name to search")
-    lines.append("_*menu* for all options_")
+    lines.append("_Reply with a number for full details_")
+    lines.append("_Type a new medicine name to search again_")
+    lines.append("_Reply *0* for main menu_")
     return "\n".join(lines)
 
 
 class WhatsAppService:
-    """Orchestrates the WhatsApp conversation flow with interactive messages."""
+    """Orchestrates the WhatsApp conversation flow — state machine."""
+
+    # ── Welcome message text ────────────────────────────────────────────
+    WELCOME = (
+        "👋 *Welcome to RERUN Health!*\n"
+        "I help you find medicines at pharmacies near you.\n\n"
+        "*What would you like to do?*\n\n"
+        "1️⃣ 💊 Find a medicine\n"
+        "2️⃣ 📍 Pharmacies near me\n"
+        "3️⃣ 💾 My saved pharmacies\n\n"
+        "_Or just tell me what you're looking for!_\n"
+        "_Reply *0* anytime for this menu_"
+    )
+
+    HELP = (
+        "ℹ️ *RERUN Health — Help*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💊 *Find Medicine* — Type any medicine name\n"
+        "📍 *Near Me* — Find pharmacies in your area\n"
+        "💾 *Saved* — View your saved pharmacies\n"
+        "📸 *Photo* — Send a prescription photo\n"
+        "⭐ *Rate* — Rate a pharmacy after viewing\n"
+        "💾 *Save* — Save a pharmacy you're viewing\n\n"
+        "_Just type what you need!_\n"
+        "_Reply *0* for main menu_"
+    )
+
+    SEARCH_PROMPT = (
+        "💊 *What medicine are you looking for?*\n\n"
+        "Type a medicine name, describe symptoms, or send a photo.\n\n"
+        "_e.g. paracetamol, \"I have a headache\", amoxicillin 500mg_\n"
+        "_Reply *0* for main menu_"
+    )
+
+    LOCATION_PROMPT = (
+        "📍 *Find pharmacies near you*\n\n"
+        "Send your location pin 📌 or type an area name.\n\n"
+        "_e.g. Avondale, Borrowdale, City Centre_\n"
+        "_Reply *0* for main menu_"
+    )
 
     async def process_message(
         self,
@@ -379,47 +461,68 @@ class WhatsAppService:
         media_url: Optional[str] = None,
         history: Optional[List[dict]] = None,
     ) -> List[dict]:
-        """Main entry point. Returns a list of message actions to send."""
+        """Main entry point. Returns a list of message actions to send (max 2)."""
 
-        # ── Prescription image ──
+        # ── Prescription / medicine image ──
         if media_url:
             return await self._handle_prescription(customer_id, media_url, message)
 
         text = message.strip()
         lower = text.lower()
 
-        # ── Quick reply button responses (from interactive templates) ──
-        if lower in ("find medicine", "💊 find medicine"):
-            return [_text("Type a medicine name or describe your symptoms.\n\n_e.g. paracetamol, headache, amoxicillin 500mg_")]
-        if lower in ("near me", "📍 near me"):
-            return [_text("Type *pharmacy* followed by an area or name.\n\n_e.g. pharmacy Avondale, pharmacy City Pharmacy_")]
-        if lower in ("scan rx", "📸 scan rx"):
-            return [_text("📸 Send a photo of your prescription and I'll identify the medicines for you.")]
-        if lower in ("rate", "⭐ rate"):
-            return [_interactive("rating")]
+        # ── GLOBAL RULES — always active ──
+        if lower in ("0", "menu", "home", "back", "main menu", "🏠 main menu", "📋 menu"):
+            return [_text(self.WELCOME)]
+        if lower in ("help", "?", "❓ help"):
+            return [_text(self.HELP)]
 
-        # ── Direct commands ──
-        if lower in ("hi", "hello", "hey", "start"):
-            return [_interactive("welcome")]
-        if lower in ("menu", "main menu", "🏠 main menu", "📋 menu"):
-            return [_interactive("menu")]
-        if lower in ("help", "❓ help"):
-            return [_interactive("help")]
+        # ── STATE 1 — Main menu triggers ──
+        if lower in ("hi", "hello", "hey", "start", "hie"):
+            return [_text(self.WELCOME)]
+        if lower in ("1", "find", "find medicine", "💊", "find a medicine", "💊 find medicine"):
+            return [_text(self.SEARCH_PROMPT)]
+        if lower in ("2", "near me", "nearby", "�", "📍 near me", "pharmacies near me"):
+            return [_text(self.LOCATION_PROMPT)]
+        if lower in ("3", "saved", "💾", "my saved", "💾 my saved pharmacies"):
+            return await self._handle_saved_pharmacies(customer_id)
+
+        # ── Quick reply button responses ──
+        if lower in ("scan rx", "📸 scan rx"):
+            return [_text("📸 Send a photo of your prescription and I'll identify the medicines for you.\n\n_Reply *0* for main menu_")]
+        if lower in ("rate", "⭐ rate"):
+            return await self._show_rating_prompt(customer_id)
+        if lower in ("save", "💾 save"):
+            return await self._handle_save_pharmacy(customer_id)
 
         # ── Rating quick reply responses ──
         if lower in ("⭐⭐⭐⭐⭐ (5)", "rate_5"):
-            return await self._handle_rating(customer_id, "rate 5", history)
+            return await self._handle_rating(customer_id, 5, history)
         if lower in ("⭐⭐⭐⭐ (4)", "rate_4"):
-            return await self._handle_rating(customer_id, "rate 4", history)
+            return await self._handle_rating(customer_id, 4, history)
         if lower in ("⭐⭐⭐ (3)", "rate_3"):
-            return await self._handle_rating(customer_id, "rate 3", history)
+            return await self._handle_rating(customer_id, 3, history)
 
-        # ── Rating (typed) ──
+        # ── Rating (typed) — "rate 4" or "rate 5 great service" ──
         if lower.startswith("rate "):
-            return await self._handle_rating(customer_id, text, history)
+            parts = text.split(None, 2)
+            try:
+                score = int(parts[1])
+                if 1 <= score <= 5:
+                    comment = parts[2] if len(parts) > 2 else None
+                    return await self._handle_rating(customer_id, score, history, comment=comment)
+            except (IndexError, ValueError):
+                pass
+            return await self._show_rating_prompt(customer_id)
+
+        # ── Skip (rating comment skip) ──
+        if lower == "skip":
+            state = await self._get_session_state(customer_id)
+            if state and state.get("awaiting_comment"):
+                return await self._finalize_rating(customer_id, state["awaiting_comment"]["score"], None, state["awaiting_comment"]["pharmacy_id"])
+            return [_text(self.WELCOME)]
 
         # ── Numeric selection (picking from results) ──
-        if lower.isdigit():
+        if lower.isdigit() and int(lower) > 0:
             return await self._handle_selection(customer_id, int(lower), history)
 
         # ── Pharmacy search ──
@@ -429,9 +532,15 @@ class WhatsAppService:
 
         # ── New search (quick reply button) ──
         if lower in ("new search", "🔍 new search"):
-            return [_text("Type a medicine name or describe your symptoms.\n\n_e.g. paracetamol, headache, amoxicillin 500mg_")]
+            return [_text(self.SEARCH_PROMPT)]
 
-        # ── Fallback: use AI to understand intent ──
+        # ── Check if user is submitting a rating comment ──
+        state = await self._get_session_state(customer_id)
+        if state and state.get("awaiting_comment"):
+            ac = state["awaiting_comment"]
+            return await self._finalize_rating(customer_id, ac["score"], text, ac["pharmacy_id"])
+
+        # ── Fallback: treat as medicine search or use AI ──
         return await self._handle_ai_intent(customer_id, text, history)
 
     # ── Handlers ────────────────────────────────────────────────────────────
@@ -440,84 +549,160 @@ class WhatsAppService:
         """Process a prescription image via OCR + AI extraction."""
         try:
             raw_text = ocr_service.extract_text_from_url(media_url)
+            logger.info(f"[OCR] user_id={customer_id} extracted=\"{raw_text[:200]}\"")
             if not raw_text.strip():
-                return [
-                    _text(
-                        "📸 I received your image but couldn't read any text from it.\n\n"
-                        "💡 Tips:\n"
-                        "  • Make sure the photo is clear and well-lit\n"
-                        "  • Try taking a closer photo\n"
-                        "  • Or type the medicine names manually"
-                    ),
-                    _interactive("menu"),
-                ]
+                return [_text(
+                    "� I couldn't read the image clearly. Please type the medicine name instead.\n\n"
+                    "_Reply *0* for main menu_"
+                )]
 
             parsed = stepfun_service.extract_medicines_from_ocr_text(raw_text)
             medicines = [m["name"] if isinstance(m, dict) else m for m in parsed]
 
             if not medicines:
-                return [
-                    _text(
-                        "📸 I scanned your prescription but couldn't identify any medicines.\n\n"
-                        "Please try typing the medicine names manually, e.g.:\n"
-                        "_\"paracetamol, amoxicillin\"_"
-                    ),
-                    _interactive("menu"),
-                ]
+                return [_text(
+                    "� I couldn't read the image clearly. Please type the medicine name instead.\n\n"
+                    "_Reply *0* for main menu_"
+                )]
 
-            return await self._search_and_format_medicines(customer_id, medicines, "[prescription scan]")
+            names_str = ", ".join(f"*{m}*" for m in medicines)
+            return [
+                _text(f"📸 I scanned your image and found: {names_str}. Searching..."),
+            ] + await self._search_and_format_medicines(customer_id, medicines, "[prescription scan]")
 
         except Exception as e:
             logger.error(f"Prescription processing error: {e}")
-            return [
-                _text("⚠️ Sorry, I had trouble processing that image.\nPlease try again or type the medicine names manually."),
-                _interactive("menu"),
-            ]
+            return [_text(
+                "😔 I couldn't read the image clearly. Please type the medicine name instead.\n\n"
+                "_Reply *0* for main menu_"
+            )]
 
-    async def _handle_rating(self, customer_id: str, text: str, history: Optional[List[dict]]) -> List[dict]:
-        """Handle 'rate N' or 'rate N comment' messages."""
-        parts = text.split(None, 2)
-        try:
-            score = int(parts[1])
-            if score < 1 or score > 5:
-                raise ValueError
-        except (IndexError, ValueError):
-            return [_interactive("rating")]
-
-        comment = parts[2] if len(parts) > 2 else None
-
-        # Find the last pharmacy the customer viewed
-        pharmacy_id = await self._get_last_viewed_pharmacy(customer_id, history)
+    async def _show_rating_prompt(self, customer_id: str) -> List[dict]:
+        """Show the rating selection prompt."""
+        pharmacy_id = await self._get_last_viewed_pharmacy(customer_id)
         if not pharmacy_id:
             return [_text(
-                "I'm not sure which pharmacy you want to rate.\n"
-                "Please view a pharmacy first by searching, then use *rate [1-5]*."
-            ), _interactive("menu")]
+                "Please view a pharmacy first, then reply *rate*.\n\n"
+                "_Reply *0* for main menu_"
+            )]
+        pharmacy = await db.get_pharmacy_by_id(pharmacy_id)
+        name = pharmacy.get("name", "this pharmacy") if pharmacy else "this pharmacy"
+        return [_text(
+            f"⭐ *Rate {name}*\n\n"
+            "1️⃣ Poor\n"
+            "2️⃣ Below average\n"
+            "3️⃣ Average\n"
+            "4️⃣ Good\n"
+            "5️⃣ Excellent\n\n"
+            "_Reply *0* for main menu_"
+        )]
 
+    async def _handle_rating(self, customer_id: str, score: int, history: Optional[List[dict]], comment: str = None) -> List[dict]:
+        """Handle rating with optional inline comment, or prompt for comment."""
+        pharmacy_id = await self._get_last_viewed_pharmacy(customer_id)
+        if not pharmacy_id:
+            return [_text(
+                "Please view a pharmacy first, then reply *rate*.\n\n"
+                "_Reply *0* for main menu_"
+            )]
+
+        if comment:
+            return await self._finalize_rating(customer_id, score, comment, pharmacy_id)
+
+        # Save state: awaiting comment
+        await db.save_conversation_message({
+            "customer_id": customer_id,
+            "role": "system",
+            "content": json.dumps({"awaiting_comment": {"score": score, "pharmacy_id": pharmacy_id}}),
+        })
+
+        return [_text(
+            f"{_stars(score)} Thanks!\n\n"
+            "Leave a comment? Type it now or reply *skip*"
+        )]
+
+    async def _finalize_rating(self, customer_id: str, score: int, comment: Optional[str], pharmacy_id: str) -> List[dict]:
+        """Save rating and return confirmation."""
         await db.create_or_update_rating({
             "customer_id": customer_id,
             "pharmacy_id": pharmacy_id,
             "score": score,
             "comment": comment,
         })
+        return [_text(
+            "✅ Rating saved! Thank you for helping others. 🙏\n\n"
+            "_Reply *0* for main menu_"
+        )]
 
-        pharmacy = await db.get_pharmacy_by_id(pharmacy_id)
-        name = pharmacy.get("name", "the pharmacy") if pharmacy else "the pharmacy"
-        return [
-            _text(f"✅ Thanks! You rated *{name}* {_stars(score)} ({score}/5)."),
-            _interactive("post_rating"),
-        ]
+    async def _handle_save_pharmacy(self, customer_id: str) -> List[dict]:
+        """Save the currently viewed pharmacy."""
+        pharmacy_id = await self._get_last_viewed_pharmacy(customer_id)
+        if not pharmacy_id:
+            return [_text(
+                "Please view a pharmacy first, then reply *save*.\n\n"
+                "_Reply *0* for main menu_"
+            )]
+        try:
+            await db.save_pharmacy_for_customer(customer_id, pharmacy_id)
+            pharmacy = await db.get_pharmacy_by_id(pharmacy_id)
+            name = pharmacy.get("name", "Pharmacy") if pharmacy else "Pharmacy"
+            return [_text(
+                f"💾 *{name}* saved!\n\n"
+                "Reply *saved* to view all your saved pharmacies.\n"
+                "_Reply *0* for main menu_"
+            )]
+        except Exception as e:
+            logger.error(f"Save pharmacy error: {e}")
+            return [_text("⚠️ Couldn't save that pharmacy. Please try again.\n\n_Reply *0* for main menu_")]
+
+    async def _handle_saved_pharmacies(self, customer_id: str) -> List[dict]:
+        """Show the customer's saved pharmacies."""
+        try:
+            saved = await db.get_saved_pharmacies(customer_id)
+        except Exception as e:
+            logger.error(f"Saved pharmacies error: {e}")
+            saved = []
+
+        if not saved:
+            return [_text(
+                "💾 *My Saved Pharmacies*\n\n"
+                "You haven't saved any pharmacies yet. Search for one to get started.\n\n"
+                "_Reply *1* to find a medicine or *0* for main menu_"
+            )]
+
+        lines = ["💾 *My Saved Pharmacies*\n"]
+        pharmacy_ids = []
+        for idx, row in enumerate(saved[:10], 1):
+            p = row.get("pharmacies") or {}
+            if not p.get("id"):
+                continue
+            pharmacy_ids.append(p["id"])
+            lines.append(_fmt_pharmacy_line(idx, p))
+            lines.append("")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("_Reply with a number for full details_")
+        lines.append("_Reply *0* for main menu_")
+
+        # Save IDs for numeric selection
+        await db.save_conversation_message({
+            "customer_id": customer_id,
+            "role": "system",
+            "content": json.dumps({"search_results": pharmacy_ids, "type": "saved"}),
+        })
+
+        return [_text("\n".join(lines))]
 
     async def _handle_selection(self, customer_id: str, idx: int, history: Optional[List[dict]]) -> List[dict]:
-        """Handle numeric selection from search results."""
+        """Handle numeric selection from results list → STATE 4 pharmacy detail."""
         last_results = await self._get_last_search_results(customer_id)
         if not last_results or idx < 1 or idx > len(last_results):
-            return [_text(f"Please reply with a number between 1 and {len(last_results) if last_results else '?'}.")]
+            return [_text(f"Please reply with a number between 1 and {len(last_results) if last_results else '?'}.\n\n_Reply *0* for main menu_")]
 
         pharmacy_id = last_results[idx - 1]
         pharmacy = await db.get_pharmacy_details(pharmacy_id)
         if not pharmacy:
-            return [_text("Sorry, that pharmacy is no longer available."), _interactive("menu")]
+            return [_text("Sorry, that pharmacy is no longer available.\n\n_Reply *0* for main menu_")]
 
         # Save that the customer is viewing this pharmacy
         await db.save_conversation_message({
@@ -526,9 +711,9 @@ class WhatsAppService:
             "content": json.dumps({"viewing_pharmacy": pharmacy_id}),
         })
 
-        actions = [_text(_fmt_pharmacy_detail(pharmacy))]
+        actions = []
 
-        # Send location card if coordinates available
+        # Message 1: Location pin (if coords available)
         lat = pharmacy.get("latitude")
         lng = pharmacy.get("longitude")
         name = pharmacy.get("name", "Pharmacy")
@@ -536,38 +721,28 @@ class WhatsAppService:
             addr = ", ".join(filter(None, [pharmacy.get("address", ""), pharmacy.get("suburb", ""), pharmacy.get("city", "")]))
             actions.append(_location(float(lat), float(lng), name, addr))
 
-        # CTA buttons: Call + Directions (max 2 per message)
-        cta_actions = []
-        phone = pharmacy.get("phone") or pharmacy.get("whatsapp_number")
-        if phone:
-            # Normalize phone for call button (must be E.164)
-            p = phone.strip().replace(" ", "")
-            if not p.startswith("+"):
-                p = f"+263{p.lstrip('0')}"
-            cta_actions.append({"title": "📞 Call", "type": "PHONE_NUMBER", "phone": p})
-        if lat and lng:
-            maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
-            cta_actions.append({"title": "🗺️ Directions", "type": "URL", "url": maps_url})
-        if cta_actions:
-            actions.append(_cta(f"Contact {name}", cta_actions))
+        # Message 2: Info card
+        actions.append(_text(_fmt_pharmacy_detail(pharmacy)))
 
-        actions.append(_interactive("pharmacy_actions"))
         return actions
 
     async def _handle_pharmacy_search(self, customer_id: str, query: str) -> List[dict]:
         """Search pharmacies by name or area."""
         if not query:
-            return [_text("Please specify a pharmacy name or area, e.g.:\n  *pharmacy Avondale*\n  *pharmacy Greenwood*")]
+            return [_text(self.LOCATION_PROMPT)]
 
         results = await db.search_pharmacies_by_name(query)
         if not results:
             results = await db.search_pharmacies_by_area(query)
 
         if not results:
-            return [
-                _text(f"😔 No pharmacies found matching *{query}*.\n\n💡 Try a different name or area."),
-                _interactive("menu"),
-            ]
+            return [_text(
+                f"😔 No pharmacies found matching *{query}*.\n"
+                "• Try a shorter name or generic alternative\n"
+                "• Share your 📍 location for a wider search\n"
+                "• Type a different area name\n\n"
+                "_Reply *0* for main menu_"
+            )]
 
         lines = [f"🏥 Pharmacies matching *{query}*:\n"]
         pharmacy_ids = []
@@ -577,6 +752,9 @@ class WhatsAppService:
             lines.append("")
 
         lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("_Reply with a number for full details_")
+        lines.append("_Type a new medicine name to search again_")
+        lines.append("_Reply *0* for main menu_")
 
         # Save result IDs for selection
         await db.save_conversation_message({
@@ -585,7 +763,7 @@ class WhatsAppService:
             "content": json.dumps({"search_results": pharmacy_ids, "type": "pharmacy"}),
         })
 
-        return [_text("\n".join(lines)), _interactive("results_nav")]
+        return [_text("\n".join(lines))]
 
     async def _handle_ai_intent(self, customer_id: str, text: str, history: Optional[List[dict]]) -> List[dict]:
         """Use AI to understand intent and route accordingly."""
@@ -593,13 +771,16 @@ class WhatsAppService:
             intent = stepfun_service.understand_intent(text, history=history)
         except Exception as e:
             logger.error(f"AI intent error: {e}")
-            return [_interactive("menu")]
+            # Fallback: treat raw input as medicine search
+            return await self._search_and_format_medicines(customer_id, [text], text)
 
         intent_type = intent.get("intent", "unknown")
         medicines = intent.get("medicines", [])
 
+        logger.info(f"[INTENT] user_id={customer_id} raw=\"{text}\" intent={intent_type} medicines={medicines}")
+
         if intent_type == "greeting":
-            return [_interactive("welcome")]
+            return [_text(self.WELCOME)]
 
         if intent_type == "search_medicine" and medicines:
             return await self._search_and_format_medicines(customer_id, medicines, text)
@@ -616,32 +797,35 @@ class WhatsAppService:
         if intent_type == "request_alternatives" and medicines:
             return await self._search_and_format_medicines(customer_id, medicines, text)
 
-        # Default: try medicine search if we found any medicine names
+        # Default: try medicine search with whatever we have
         if medicines:
             return await self._search_and_format_medicines(customer_id, medicines, text)
 
-        return [_text("🤔 I'm not sure what you're looking for."), _interactive("menu")]
+        # Last resort: treat raw text as medicine search
+        return await self._search_and_format_medicines(customer_id, [text], text)
 
     # ── Internal helpers ────────────────────────────────────────────────────
 
     async def _search_and_format_medicines(
         self, customer_id: str, medicines: List[str], query: str
     ) -> List[dict]:
-        """Search medicines, log analytics, format results."""
+        """Search medicines, log analytics, format results. Auto-add unverified if not found."""
         results = await search_service.find_medicines(medicines)
         await analytics_service.log_search(customer_id, query, results)
 
         if not results:
-            names = ", ".join(medicines)
-            return [
-                _text(
-                    f"😔 Sorry, I couldn't find *{names}* in stock at any pharmacy.\n\n"
-                    "💡 Try:\n"
-                    "  • A different spelling or generic name\n"
-                    "  • Describing your symptoms instead"
-                ),
-                _interactive("menu"),
-            ]
+            # Add unverified medicines for admin review
+            for med_name in medicines:
+                await db.add_unverified_medicine(med_name.strip(), added_by=customer_id)
+
+            names = ", ".join(f"*{m}*" for m in medicines)
+            return [_text(
+                f"� No pharmacies found with {names} nearby.\n"
+                "• Try a shorter name or generic alternative\n"
+                "• Share your 📍 location for a wider search\n"
+                "• Type a different medicine name\n\n"
+                "_Reply *0* for main menu_"
+            )]
 
         # Collect pharmacy IDs for selection
         all_pharmacy_ids = []
@@ -666,7 +850,7 @@ class WhatsAppService:
             "content": json.dumps({"search_results": all_pharmacy_ids, "type": "medicine"}),
         })
 
-        return [_text("\n\n".join(response_parts)), _interactive("results_nav")]
+        return [_text("\n\n".join(response_parts))]
 
     async def _get_last_search_results(self, customer_id: str) -> Optional[List[str]]:
         """Get pharmacy IDs from the last search results in conversation."""
@@ -681,7 +865,7 @@ class WhatsAppService:
                     continue
         return None
 
-    async def _get_last_viewed_pharmacy(self, customer_id: str, history: Optional[List[dict]]) -> Optional[str]:
+    async def _get_last_viewed_pharmacy(self, customer_id: str, history: Optional[List[dict]] = None) -> Optional[str]:
         """Get the last pharmacy ID the customer viewed."""
         rows = await db.get_conversation_history(customer_id, limit=20)
         for msg in reversed(rows):
@@ -690,6 +874,19 @@ class WhatsAppService:
                     data = json.loads(msg.get("content", "{}"))
                     if "viewing_pharmacy" in data:
                         return data["viewing_pharmacy"]
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        return None
+
+    async def _get_session_state(self, customer_id: str) -> Optional[dict]:
+        """Get the latest session state from conversation (e.g. awaiting_comment)."""
+        rows = await db.get_conversation_history(customer_id, limit=5)
+        for msg in reversed(rows):
+            if msg.get("role") == "system":
+                try:
+                    data = json.loads(msg.get("content", "{}"))
+                    if "awaiting_comment" in data:
+                        return data
                 except (json.JSONDecodeError, TypeError):
                     continue
         return None

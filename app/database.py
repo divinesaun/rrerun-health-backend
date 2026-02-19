@@ -526,6 +526,60 @@ async def update_customer(customer_id: str, data: Dict) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Saved pharmacies helpers
+# ---------------------------------------------------------------------------
+
+async def save_pharmacy_for_customer(customer_id: str, pharmacy_id: str) -> Dict:
+    """Save a pharmacy for a customer (idempotent)."""
+    existing = (
+        supabase.table("saved_pharmacies")
+        .select("id")
+        .eq("customer_id", customer_id)
+        .eq("pharmacy_id", pharmacy_id)
+        .execute()
+    )
+    if existing.data:
+        return existing.data[0]
+    result = supabase.table("saved_pharmacies").insert({
+        "customer_id": customer_id,
+        "pharmacy_id": pharmacy_id,
+    }).execute()
+    return result.data[0] if result.data else {}
+
+
+async def get_saved_pharmacies(customer_id: str) -> List[Dict]:
+    """Get all saved pharmacies for a customer."""
+    result = (
+        supabase.table("saved_pharmacies")
+        .select("pharmacy_id, pharmacies(id, name, address, suburb, city, phone, whatsapp_number, opening_hours, rating, total_reviews, has_delivery, accepts_medical_aid, is_24_hours, latitude, longitude)")
+        .eq("customer_id", customer_id)
+        .order("saved_at", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+async def unsave_pharmacy_for_customer(customer_id: str, pharmacy_id: str) -> bool:
+    """Remove a saved pharmacy."""
+    supabase.table("saved_pharmacies").delete().eq("customer_id", customer_id).eq("pharmacy_id", pharmacy_id).execute()
+    return True
+
+
+async def add_unverified_medicine(name: str, added_by: str = "") -> Optional[Dict]:
+    """Insert an unmatched medicine for admin review if it doesn't already exist."""
+    try:
+        existing = supabase.table("medicines").select("id").ilike("name", name).limit(1).execute()
+        if existing.data:
+            return existing.data[0]
+        result = supabase.table("medicines").insert({"name": name}).execute()
+        logger.info(f"[NEW_MEDICINE] \"{name}\" added by user {added_by} — pending admin review")
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"Failed to add unverified medicine '{name}': {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Conversation history helpers
 # ---------------------------------------------------------------------------
 
