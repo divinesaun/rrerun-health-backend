@@ -877,14 +877,15 @@ class TestEdgeCases:
         # session should still have search_results after save
         mock_db.save_pharmacy_for_customer.assert_called_once()
 
-    async def test_pharmacy_detail_has_maps_link(self, svc, mock_db):
-        """Pharmacy detail card should include Google Maps link when coordinates exist."""
+    async def test_pharmacy_detail_no_maps_link(self, svc, mock_db):
+        """Pharmacy detail card should NOT include a Maps link — location pin is sent instead."""
         set_session(mock_db, search_results=[PHARM_ID_A])
         mock_db.get_pharmacy_details.return_value = PHARMACY_A
         result = await svc.process_message(CUST, "1")
         text_bodies = [a["body"] for a in result if a["type"] == "text"]
         detail = " ".join(text_bodies)
-        assert "maps.google.com" in detail
+        assert "maps.google.com" not in detail
+        assert "Main St" in detail  # address still shown as plain text
 
     async def test_pharmacy_detail_has_location_pin(self, svc, mock_db):
         """Pharmacy with coordinates should send a location pin."""

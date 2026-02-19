@@ -23,7 +23,7 @@ I help you find medicines at pharmacies near you.
 _Just type a medicine name to get started!_
 _Reply *0* anytime for this menu_
 
-📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+📦 SESSION: {}
 
 
 ### FLOW 2: MENU COMMANDS ###
@@ -118,6 +118,10 @@ _Reply *0* for main menu_
 👤 USER: 1
 ============================================================
 
+🤖 BOT (location pin):
+   📍 Better Care Pharmacy — 20 Taseka Road, Chitungwiza, Harare
+   lat=-17.8176943, lng=31.0501388
+
 🤖 BOT (text):
 🏥 *Better Care Pharmacy*
 🟢 Open Now
@@ -135,7 +139,7 @@ _Reply *0* for main menu_
   Sat  Closed
   Sun  Closed
 
-⭐⭐⭐⭐⭐ 5.0/5 (1 review)
+⭐⭐⭐⭐⭐ 5.0/5.0 (1 review)
 
 ━━━━━━━━━━━━━━━━━━━━
 _*rate 1-5* to rate · *save* to bookmark_
@@ -259,16 +263,26 @@ _Reply *0* for main menu_
 ============================================================
 
 🤖 BOT (text):
-💊 Results for *Paracetamol 500mg*, *Ibuprofen 200mg*:
+🤒 Common OTC options for *headache / mild pain*:
+*Paracetamol*, *Ibuprofen*, *Aspirin*
+
+_⚕️ Please consult your pharmacist before taking any medication._
+
+🤖 BOT (text):
+💊 Results for *Paracetamol*, *Ibuprofen*:
 
 1. 🟢 Open Now *Better Care Pharmacy*
    💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
    💊 Ibuprofen 200mg — $4.2 ✅ In Stock (95+)
+   💊 Ibuprofen Syrup 100mg — $4.0 ✅ In Stock (90+)
    📍 20 Taseka Road, Chitungwiza
    📞 +263786280681
 
 2. 🔴 Closed (Opens Mon 8:00AM) *Green Valley Pharmacy*
    💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
+   💊 Ibuprofen Syrup 100mg — $4.0 ✅ In Stock (90+)
    📍 Shop 4, Green Valley Shopping Centre, 56 Samora Machel Avenue, Eastlea
    📞 +263786280681
 
@@ -393,6 +407,10 @@ _Reply *0* for main menu_
 👤 USER: 1
 ============================================================
 
+🤖 BOT (location pin):
+   📍 Better Care Pharmacy — 20 Taseka Road, Chitungwiza, Harare
+   lat=-17.8176943, lng=31.0501388
+
 🤖 BOT (text):
 🏥 *Better Care Pharmacy*
 🟢 Open Now
@@ -410,7 +428,7 @@ _Reply *0* for main menu_
   Sat  Closed
   Sun  Closed
 
-⭐⭐⭐⭐⭐ 5.0/5 (1 review)
+⭐⭐⭐⭐⭐ 5.0/5.0 (1 review)
 
 ━━━━━━━━━━━━━━━━━━━━
 _*rate 1-5* to rate · *save* to bookmark_
@@ -477,6 +495,10 @@ _Reply *0* for main menu_
 👤 USER: 1
 ============================================================
 
+🤖 BOT (location pin):
+   📍 Better Care Pharmacy — 20 Taseka Road, Chitungwiza, Harare
+   lat=-17.8176943, lng=31.0501388
+
 🤖 BOT (text):
 🏥 *Better Care Pharmacy*
 🟢 Open Now
@@ -494,7 +516,7 @@ _Reply *0* for main menu_
   Sat  Closed
   Sun  Closed
 
-⭐⭐⭐⭐⭐ 5.0/5 (1 review)
+⭐⭐⭐⭐⭐ 5.0/5.0 (1 review)
 
 ━━━━━━━━━━━━━━━━━━━━
 _*rate 1-5* to rate · *save* to bookmark_
@@ -521,6 +543,14 @@ _Reply *0* for main menu_
 ============================================================
 👤 USER: https://maps.google.com/?q=-17.7847594,31.0510115
 ============================================================
+
+🤖 BOT (location pin):
+   📍 Better Care Pharmacy — 20 Taseka Road, Chitungwiza, Harare
+   lat=-17.8176943, lng=31.0501388
+
+🤖 BOT (location pin):
+   📍 Green Valley Pharmacy — Shop 4, Green Valley Shopping Centre, 56 Samora Machel Avenue, Eastlea, Harare
+   lat=-17.83119, lng=31.0486232
 
 🤖 BOT (text):
 🏥 Pharmacies near *your location 📍*:

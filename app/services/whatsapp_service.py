@@ -230,15 +230,10 @@ def _fmt_pharmacy_detail(p: dict) -> str:
         lines.append(status)
     lines.append("")
 
-    # Address + Maps link
+    # Address (Maps link removed — location pin is sent as a separate message)
     loc = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", ""), p.get("city", "")]))
     if loc:
-        lat, lng = p.get("latitude"), p.get("longitude")
-        if lat and lng:
-            lines.append(f"📍 {loc}")
-            lines.append(f"🗺️ https://maps.google.com/?q={lat},{lng}")
-        else:
-            lines.append(f"📍 {loc}")
+        lines.append(f"📍 {loc}")
         lines.append("")
 
     # Phone
@@ -280,7 +275,8 @@ def _fmt_pharmacy_detail(p: dict) -> str:
     reviews = p.get("total_reviews", 0)
     if rating:
         full = int(float(rating))
-        lines.append(f"{'⭐' * full} {rating}/5 ({reviews} review{'s' if reviews != 1 else ''})")
+        rating_fmt = f"{float(rating):.1f}"
+        lines.append(f"{'⭐' * full} {rating_fmt}/5.0 ({reviews} review{'s' if reviews != 1 else ''})")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -585,14 +581,64 @@ class WhatsAppService:
 
         return await self._format_pharmacy_results(customer_id, results[:5], "your location 📍")
 
+    # Common symptom → OTC suggestion map (shown before searching)
+    _SYMPTOM_SUGGESTIONS: dict = {
+        "headache":     ("headache / mild pain",   ["Paracetamol", "Ibuprofen", "Aspirin"]),
+        "pain":         ("pain relief",             ["Paracetamol", "Ibuprofen", "Diclofenac"]),
+        "fever":        ("fever",                   ["Paracetamol", "Ibuprofen"]),
+        "cold":         ("cold & flu",              ["Flu medication", "Paracetamol", "Vitamin C"]),
+        "flu":          ("cold & flu",              ["Flu medication", "Paracetamol", "Vitamin C"]),
+        "cough":        ("cough",                   ["Cough syrup", "Bromhexine", "Honey & Lemon"]),
+        "sore throat":  ("sore throat",             ["Strepsils", "Benzocaine lozenges", "Ibuprofen"]),
+        "allerg":       ("allergies",               ["Cetirizine", "Loratadine", "Chlorphenamine"]),
+        "stomach":      ("stomach / indigestion",   ["Omeprazole", "Antacid", "Buscopan"]),
+        "nausea":       ("nausea / vomiting",       ["Metoclopramide", "Domperidone", "Ginger tablets"]),
+        "vomit":        ("nausea / vomiting",       ["Metoclopramide", "Domperidone"]),
+        "diarrhea":     ("diarrhoea",               ["ORS sachets", "Loperamide", "Zinc tablets"]),
+        "heartburn":    ("heartburn / acid reflux", ["Omeprazole", "Antacid", "Ranitidine"]),
+        "rash":         ("skin rash / itch",        ["Hydrocortisone cream", "Cetirizine", "Calamine lotion"]),
+        "itch":         ("skin itch",               ["Hydrocortisone cream", "Cetirizine", "Calamine lotion"]),
+        "infection":    ("infection",               ["Amoxicillin", "Metronidazole", "Flucloxacillin"]),
+        "toothache":    ("toothache",               ["Ibuprofen", "Paracetamol", "Clove oil"]),
+        "earache":      ("earache",                 ["Ibuprofen", "Paracetamol", "Ear drops"]),
+        "back pain":    ("back pain",               ["Ibuprofen", "Diclofenac gel", "Muscle relaxant"]),
+        "chest pain":   ("chest discomfort",        ["Antacid", "Ibuprofen"]),
+        "cramp":        ("cramps",                  ["Buscopan", "Ibuprofen", "Magnesium"]),
+        "runny nose":   ("runny / blocked nose",    ["Pseudoephedrine", "Saline nasal spray", "Cetirizine"]),
+        "blocked nose": ("runny / blocked nose",    ["Pseudoephedrine", "Saline nasal spray", "Xylometazoline"]),
+        "dizzy":        ("dizziness",               ["Stugeron", "Betahistine"]),
+        "swelling":     ("swelling / inflammation", ["Ibuprofen", "Diclofenac", "Compression bandage"]),
+    }
+
+    def _get_symptom_suggestion(self, text: str) -> Optional[Tuple[str, List[str]]]:
+        """Return (label, [medicine names]) for the best matching symptom keyword, or None."""
+        lower = text.lower()
+        for kw, (label, meds) in self._SYMPTOM_SUGGESTIONS.items():
+            if kw in lower:
+                return label, meds
+        return None
+
     async def _handle_symptoms(self, customer_id: str, text: str) -> List[dict]:
         """Use LLM to extract medicine names from symptom description, then search."""
+        # Build a friendly suggestion header before searching
+        suggestion = self._get_symptom_suggestion(text)
         try:
             medicines = stepfun_service.extract_medicines_from_text(text)
             logger.info(f"[SYMPTOMS→LLM] customer={customer_id} text={text!r} medicines={medicines}")
 
             if medicines:
-                return await self._search_medicines(customer_id, medicines, text)
+                results = await self._search_medicines(customer_id, medicines, text)
+                # Prepend a suggestion note with disclaimer as first message
+                if suggestion:
+                    label, suggested = suggestion
+                    meds_str = ", ".join(f"*{m}*" for m in suggested)
+                    note = (
+                        f"🤒 Common OTC options for *{label}*:\n"
+                        f"{meds_str}\n\n"
+                        f"_⚕️ Please consult your pharmacist before taking any medication._"
+                    )
+                    return [_text(note)] + results
+                return results
         except Exception as e:
             logger.error(f"Symptom LLM error: {e}")
 
@@ -829,7 +875,8 @@ class WhatsAppService:
         return await self._format_pharmacy_results(customer_id, results[:5], query)
 
     async def _format_pharmacy_results(self, customer_id: str, results: list, label: str) -> List[dict]:
-        """Format a pharmacy list and save IDs for selection."""
+        """Format a pharmacy list with location pins and save IDs for selection."""
+        actions = []
         lines = [f"🏥 Pharmacies near *{label}*:\n"]
         pharmacy_ids = []
         for idx, p in enumerate(results, 1):
@@ -846,12 +893,20 @@ class WhatsAppService:
                 lines.append(f"   📞 {phone}")
             lines.append("")
 
+            # Send a location pin for each pharmacy that has coordinates
+            lat, lng = p.get("latitude"), p.get("longitude")
+            if lat and lng:
+                addr = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", ""), p.get("city", "")]))
+                actions.append(_location(float(lat), float(lng), p.get("name", "Pharmacy"), addr))
+
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append("_Reply with a *number* for full details_")
         lines.append("_Reply *0* for main menu_")
 
         await _save_session(customer_id, {"search_results": pharmacy_ids})
-        return [_text("\n".join(lines))]
+        # Location pins first, then the text list
+        actions.append(_text("\n".join(lines)))
+        return actions
 
 
 whatsapp_service = WhatsAppService()
