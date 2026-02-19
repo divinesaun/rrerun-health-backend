@@ -24,11 +24,13 @@ class StepFunService:
             "X-Title": "RERUN Health AI",
         }
 
-    def _chat(self, system: str, user: str, history: Optional[List[dict]] = None) -> str:
+    def _chat(self, system: str, user: str, history: Optional[List[dict]] = None, label: str = "LLM") -> str:
         messages = [{"role": "system", "content": system}]
         if history:
             messages.extend(history)
         messages.append({"role": "user", "content": user})
+
+        logger.info(f"[{label}] REQUEST  system={system[:200]!r}  user={user[:200]!r}  history_len={len(history) if history else 0}")
 
         try:
             payload = {
@@ -43,9 +45,11 @@ class StepFunService:
             )
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"]
+            logger.info(f"[{label}] RESPONSE content={content[:500]!r}")
+            return content
         except Exception as e:
-            logger.error(f"StepFun API error: {e}")
+            logger.error(f"[{label}] ERROR: {e}")
             raise
 
     def _safe_json_parse(self, text: str, fallback=None):
@@ -70,6 +74,7 @@ class StepFunService:
                 "If the user describes symptoms, map them to common medicines. Return [] if nothing found."
             ),
             user=query,
+            label="EXTRACT_MEDS_TEXT",
         )
         return self._safe_json_parse(result, [])
 
@@ -84,12 +89,14 @@ class StepFunService:
                 "If nothing is identifiable, return []."
             ),
             user=f"Prescription OCR text:\n{ocr_text}",
+            label="EXTRACT_MEDS_OCR",
         )
         return self._safe_json_parse(result, [])
 
     def understand_intent(self, query: str, history: Optional[List[dict]] = None) -> Dict:
         """Determine the user's intent and any follow-up context."""
         result = self._chat(
+            label="UNDERSTAND_INTENT",
             system=(
                 "You are the AI brain of a WhatsApp pharmacy bot in Zimbabwe called RERUN Health.\n"
                 "Determine the user's intent from their message.\n\n"
@@ -129,6 +136,7 @@ class StepFunService:
         """Generate a friendly WhatsApp-formatted reply from search results."""
         context = json.dumps({"medicines": medicines, "pharmacies": pharmacies}, default=str)
         return self._chat(
+            label="FORMAT_RESPONSE",
             system=(
                 "You are a WhatsApp pharmacy bot. Format search results into a friendly, "
                 "concise WhatsApp message using emojis. List pharmacies with name, price, stock status, "
@@ -142,6 +150,7 @@ class StepFunService:
     def fix_inventory_csv(self, raw_csv: str) -> str:
         """Correct a malformed inventory CSV so it matches the expected format."""
         return self._chat(
+            label="FIX_CSV",
             system=(
                 "You are a data-cleaning assistant for a pharmacy inventory system.\n"
                 "The user will give you the raw text of a CSV file that may have wrong "

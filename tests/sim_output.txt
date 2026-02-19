@@ -1,0 +1,605 @@
+
+🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 
+WHATSAPP BOT — LIVE CONVERSATION SIMULATION
+🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 🔬 
+
+
+### FLOW 1: GREETING ###
+
+============================================================
+👤 USER: hi
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+
+### FLOW 2: MENU COMMANDS ###
+
+============================================================
+👤 USER: 0
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: menu
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: help
+============================================================
+
+🤖 BOT (text):
+ℹ️ *RERUN Health — Quick Guide*
+━━━━━━━━━━━━━━━━━━━━
+
+💊 Type any *medicine name* to search
+🤒 Describe *symptoms* and I'll suggest medicines
+📸 Send a *prescription photo* to scan
+📍 Type *pharmacy [area]* to find nearby
+⭐ Type *rate 1-5* after viewing a pharmacy
+💾 Type *save* to bookmark a pharmacy
+
+_Reply *0* for main menu_
+
+📦 SESSION: {}
+
+
+### FLOW 3: MEDICINE SEARCH → SELECT ###
+
+============================================================
+👤 USER: paracetamol
+============================================================
+
+🤖 BOT (text):
+💊 Results for *paracetamol*:
+
+1. 🟢 Open Now *Better Care Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
+   📍 20 Taseka Road, Chitungwiza
+   📞 +263786280681
+
+2. 🔴 Closed (Opens Mon 8:00AM) *Green Valley Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
+   📍 Shop 4, Green Valley Shopping Centre, 56 Samora Machel Avenue, Eastlea
+   📞 +263786280681
+
+━━━━━━━━━━━━━━━━━━━━
+_Reply with a *number* for full details_
+_Type another medicine name to search_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"]}
+
+============================================================
+👤 USER: 1
+============================================================
+
+🤖 BOT (text):
+🏥 *Better Care Pharmacy*
+🟢 Open Now
+
+📍 20 Taseka Road, Chitungwiza, Harare
+
+📞 +263786280681
+
+*🕐 Hours*
+  Mon  8:00AM – 6:00PM
+  Tue  8:00AM – 6:00PM
+  Wed  8:00AM – 6:00PM
+  Thu  8:00AM – 6:00PM
+  Fri  8:00AM – 6:00PM
+  Sat  Closed
+  Sun  Closed
+
+⭐⭐⭐⭐⭐ 5.0/5 (1 review)
+
+━━━━━━━━━━━━━━━━━━━━
+_*rate 1-5* to rate · *save* to bookmark_
+_Type a medicine name to search again_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+
+### FLOW 4: NUMBER → MENU (no results context) ###
+
+============================================================
+👤 USER: 0
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: 1
+============================================================
+
+🤖 BOT (text):
+💊 *What medicine do you need?*
+
+You can:
+• Type a medicine name (e.g. _paracetamol_)
+• Describe symptoms (e.g. _I have a headache_)
+• Send a prescription 📸 photo
+
+_Reply *0* for main menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: 0
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: 2
+============================================================
+
+🤖 BOT (text):
+📍 *Find pharmacies near you*
+
+Type an area name, e.g.:
+  _pharmacy Avondale_
+  _pharmacy Borrowdale_
+
+_Reply *0* for main menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: 0
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: 3
+============================================================
+
+🤖 BOT (text):
+💾 *My Saved Pharmacies*
+
+1. 🟢 Open Now *Better Care Pharmacy*
+   📍 Chitungwiza
+
+━━━━━━━━━━━━━━━━━━━━
+_Reply with a number for details_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038"]}
+
+
+### FLOW 5: SYMPTOM DETECTION ###
+
+============================================================
+👤 USER: I have a headache
+============================================================
+
+🤖 BOT (text):
+💊 Results for *Paracetamol 500mg*, *Ibuprofen 200mg*:
+
+1. 🟢 Open Now *Better Care Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Ibuprofen 200mg — $4.2 ✅ In Stock (95+)
+   📍 20 Taseka Road, Chitungwiza
+   📞 +263786280681
+
+2. 🔴 Closed (Opens Mon 8:00AM) *Green Valley Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   📍 Shop 4, Green Valley Shopping Centre, 56 Samora Machel Avenue, Eastlea
+   📞 +263786280681
+
+━━━━━━━━━━━━━━━━━━━━
+_Reply with a *number* for full details_
+_Type another medicine name to search_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"]}
+
+
+### FLOW 6: PHARMACY SEARCH ###
+
+============================================================
+👤 USER: pharmacy Avondale
+============================================================
+
+🤖 BOT (text):
+😔 No pharmacies found for *Avondale*.
+
+Try a different area name or spelling.
+
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"]}
+
+============================================================
+👤 USER: pharmacy
+============================================================
+
+🤖 BOT (text):
+📍 *Find pharmacies near you*
+
+Type an area name, e.g.:
+  _pharmacy Avondale_
+  _pharmacy Borrowdale_
+
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"]}
+
+
+### FLOW 7: EXPLICIT COMMANDS ###
+
+============================================================
+👤 USER: find
+============================================================
+
+🤖 BOT (text):
+💊 *What medicine do you need?*
+
+You can:
+• Type a medicine name (e.g. _paracetamol_)
+• Describe symptoms (e.g. _I have a headache_)
+• Send a prescription 📸 photo
+
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"]}
+
+============================================================
+👤 USER: near me
+============================================================
+
+🤖 BOT (text):
+📍 *Find pharmacies near you*
+
+Type an area name, e.g.:
+  _pharmacy Avondale_
+  _pharmacy Borrowdale_
+
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"]}
+
+============================================================
+👤 USER: saved
+============================================================
+
+🤖 BOT (text):
+💾 *My Saved Pharmacies*
+
+1. 🟢 Open Now *Better Care Pharmacy*
+   📍 Chitungwiza
+
+━━━━━━━━━━━━━━━━━━━━
+_Reply with a number for details_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038"]}
+
+
+### FLOW 8: RATE FLOW ###
+
+============================================================
+👤 USER: paracetamol
+============================================================
+
+🤖 BOT (text):
+💊 Results for *paracetamol*:
+
+1. 🟢 Open Now *Better Care Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
+   📍 20 Taseka Road, Chitungwiza
+   📞 +263786280681
+
+2. 🔴 Closed (Opens Mon 8:00AM) *Green Valley Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
+   📍 Shop 4, Green Valley Shopping Centre, 56 Samora Machel Avenue, Eastlea
+   📞 +263786280681
+
+━━━━━━━━━━━━━━━━━━━━
+_Reply with a *number* for full details_
+_Type another medicine name to search_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"]}
+
+============================================================
+👤 USER: 1
+============================================================
+
+🤖 BOT (text):
+🏥 *Better Care Pharmacy*
+🟢 Open Now
+
+📍 20 Taseka Road, Chitungwiza, Harare
+
+📞 +263786280681
+
+*🕐 Hours*
+  Mon  8:00AM – 6:00PM
+  Tue  8:00AM – 6:00PM
+  Wed  8:00AM – 6:00PM
+  Thu  8:00AM – 6:00PM
+  Fri  8:00AM – 6:00PM
+  Sat  Closed
+  Sun  Closed
+
+⭐⭐⭐⭐⭐ 5.0/5 (1 review)
+
+━━━━━━━━━━━━━━━━━━━━
+_*rate 1-5* to rate · *save* to bookmark_
+_Type a medicine name to search again_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+============================================================
+👤 USER: rate 5
+============================================================
+
+🤖 BOT (text):
+⭐⭐⭐⭐⭐ Got it!
+
+Want to leave a comment? Type it now, or reply *skip*.
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038", "awaiting_comment": {"score": 5, "pharm
+
+============================================================
+👤 USER: Great service!
+============================================================
+
+🤖 BOT (text):
+✅ You rated *Better Care Pharmacy* ⭐⭐⭐⭐⭐
+_Great service!_
+
+Thank you! 🙏
+
+_Type a medicine name to search, or *0* for menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+
+### FLOW 9: SAVE FLOW ###
+
+============================================================
+👤 USER: paracetamol
+============================================================
+
+🤖 BOT (text):
+💊 Results for *paracetamol*:
+
+1. 🟢 Open Now *Better Care Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
+   📍 20 Taseka Road, Chitungwiza
+   📞 +263786280681
+
+2. 🔴 Closed (Opens Mon 8:00AM) *Green Valley Pharmacy*
+   💊 Paracetamol 500mg — $3.5 ✅ In Stock (120+)
+   💊 Paracetamol Syrup 120mg — $3.8 ✅ In Stock (100+)
+   📍 Shop 4, Green Valley Shopping Centre, 56 Samora Machel Avenue, Eastlea
+   📞 +263786280681
+
+━━━━━━━━━━━━━━━━━━━━
+_Reply with a *number* for full details_
+_Type another medicine name to search_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+============================================================
+👤 USER: 1
+============================================================
+
+🤖 BOT (text):
+🏥 *Better Care Pharmacy*
+🟢 Open Now
+
+📍 20 Taseka Road, Chitungwiza, Harare
+
+📞 +263786280681
+
+*🕐 Hours*
+  Mon  8:00AM – 6:00PM
+  Tue  8:00AM – 6:00PM
+  Wed  8:00AM – 6:00PM
+  Thu  8:00AM – 6:00PM
+  Fri  8:00AM – 6:00PM
+  Sat  Closed
+  Sun  Closed
+
+⭐⭐⭐⭐⭐ 5.0/5 (1 review)
+
+━━━━━━━━━━━━━━━━━━━━
+_*rate 1-5* to rate · *save* to bookmark_
+_Type a medicine name to search again_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+============================================================
+👤 USER: save
+============================================================
+
+🤖 BOT (text):
+💾 *Better Care Pharmacy* saved!
+
+Type *saved* to see all your bookmarks.
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+
+### FLOW 10: LOCATION ###
+
+============================================================
+👤 USER: https://maps.google.com/?q=-17.7847594,31.0510115
+============================================================
+
+🤖 BOT (text):
+🏥 Pharmacies near *your location 📍*:
+
+1. 🟢 Open Now *Better Care Pharmacy*
+   📍 20 Taseka Road, Chitungwiza
+   📞 +263786280681
+
+2. 🔴 Closed (Opens Mon 8:00AM) *Green Valley Pharmacy*
+   📍 Shop 4, Green Valley Shopping Centre, 56 Samora Machel Avenue, Eastlea
+   📞 +263786280681
+
+━━━━━━━━━━━━━━━━━━━━
+_Reply with a *number* for full details_
+_Reply *0* for main menu_
+
+📦 SESSION: {"search_results": ["41d7a880-4b49-4288-98c8-b54a64b94038", "e669d047-8fa6-403c-bd2b-ed72c3d09fba"], "viewing_pharmacy": "41d7a880-4b49-4288-98c8-b54a64b94038"}
+
+
+### FLOW 11: EDGE CASES ###
+
+============================================================
+👤 USER: back
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: HELP
+============================================================
+
+🤖 BOT (text):
+ℹ️ *RERUN Health — Quick Guide*
+━━━━━━━━━━━━━━━━━━━━
+
+💊 Type any *medicine name* to search
+🤒 Describe *symptoms* and I'll suggest medicines
+📸 Send a *prescription photo* to scan
+📍 Type *pharmacy [area]* to find nearby
+⭐ Type *rate 1-5* after viewing a pharmacy
+💾 Type *save* to bookmark a pharmacy
+
+_Reply *0* for main menu_
+
+📦 SESSION: {}
+
+============================================================
+👤 USER: Hello
+============================================================
+
+🤖 BOT (text):
+👋 *Welcome to RERUN Health!*
+I help you find medicines at pharmacies near you.
+
+*What would you like to do?*
+
+1️⃣ 💊 Find a medicine
+2️⃣ 📍 Pharmacies near me
+3️⃣ 💾 My saved pharmacies
+
+_Just type a medicine name to get started!_
+_Reply *0* anytime for this menu_
+
+📦 SESSION: {}
+
+
+✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ 
+SIMULATION COMPLETE
+✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ 

@@ -292,27 +292,25 @@ def _fmt_pharmacy_detail(p: dict) -> str:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Session state helpers
+#
+# Session data is stored as a SINGLE system message in conversation_history
+# tagged with "_session": true.  Every write reads the current state first,
+# merges updates, and writes a new consolidated message so all keys live in
+# one place.  This prevents state from being "lost" as messages accumulate.
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _save_session(customer_id: str, data: dict) -> None:
-    """Write a session state marker into conversation history."""
-    await db.save_conversation_message({
-        "customer_id": customer_id,
-        "role": "system",
-        "content": json.dumps(data),
-    })
+_SESSION_MARKER = "_session"
 
 
 async def _read_session(customer_id: str) -> dict:
-    """Read the most recent session state from conversation history.
+    """Read the most recent consolidated session state.
 
-    Returns a dict that may contain keys:
-      search_results  — list of pharmacy IDs from last search
+    Returns a dict that may contain:
+      search_results   — list of pharmacy IDs from last search
       viewing_pharmacy — pharmacy ID currently being viewed
       awaiting_comment — {score, pharmacy_id} if waiting for rating comment
     """
-    rows = await db.get_conversation_history(customer_id, limit=20)
-    state = {}
+    rows = await db.get_conversation_history(customer_id, limit=30)
     for msg in reversed(rows):
         if msg.get("role") != "system":
             continue
@@ -320,17 +318,28 @@ async def _read_session(customer_id: str) -> dict:
             data = json.loads(msg.get("content", "{}"))
         except (json.JSONDecodeError, TypeError):
             continue
-        # Pick up the first (most recent) of each key we find
-        if "search_results" in data and "search_results" not in state:
-            state["search_results"] = data["search_results"]
-        if "viewing_pharmacy" in data and "viewing_pharmacy" not in state:
-            state["viewing_pharmacy"] = data["viewing_pharmacy"]
-        if "awaiting_comment" in data and "awaiting_comment" not in state:
-            state["awaiting_comment"] = data["awaiting_comment"]
-        # Stop early once we have everything
-        if all(k in state for k in ("search_results", "viewing_pharmacy")):
-            break
-    return state
+        if data.get(_SESSION_MARKER):
+            # Return all keys except the marker itself
+            return {k: v for k, v in data.items() if k != _SESSION_MARKER}
+    return {}
+
+
+async def _save_session(customer_id: str, updates: dict) -> None:
+    """Merge *updates* into the current session and write a new consolidated message.
+
+    To remove a key, set it to None in updates — it will be stripped out.
+    """
+    current = await _read_session(customer_id)
+    current.update(updates)
+    # Strip None values (used to explicitly clear keys like awaiting_comment)
+    cleaned = {k: v for k, v in current.items() if v is not None}
+    cleaned[_SESSION_MARKER] = True
+    await db.save_conversation_message({
+        "customer_id": customer_id,
+        "role": "system",
+        "content": json.dumps(cleaned),
+    })
+    logger.debug(f"[SESSION] customer={customer_id} state={cleaned}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -393,32 +402,44 @@ class WhatsAppService:
         text = message.strip()
         lower = text.lower()
 
-        # ── 1. GLOBAL: menu / back ──
+        # ── 1. GLOBAL: menu / back — clears session so menu numbers 1/2/3 work ──
         if lower in ("0", "menu", "home", "back", "main menu"):
+            logger.info(f"[ROUTE] customer={customer_id} path=GLOBAL_MENU input={lower!r}")
+            await _save_session(customer_id, {
+                "search_results": None,
+                "viewing_pharmacy": None,
+                "awaiting_comment": None,
+            })
             return [_text(self.WELCOME)]
 
         # ── 2. GLOBAL: help ──
         if lower in ("help", "?"):
+            logger.info(f"[ROUTE] customer={customer_id} path=GLOBAL_HELP input={lower!r}")
             return [_text(self.HELP)]
 
         # ── 3. Media → OCR pipeline ──
         if media_url:
+            logger.info(f"[ROUTE] customer={customer_id} path=MEDIA_OCR url={media_url[:80]}")
             return await self._handle_image(customer_id, media_url)
 
         # ── 4. Location detection ──
         coords = _extract_location(text)
         if coords:
+            logger.info(f"[ROUTE] customer={customer_id} path=LOCATION coords={coords}")
             return await self._handle_location(customer_id, coords)
 
         # ── 5. Read session state for context-aware routing ──
         session = await _read_session(customer_id)
+        logger.debug(f"[ROUTE] customer={customer_id} session_keys={list(session.keys())} input={text[:80]!r}")
 
         # ── 6. Awaiting rating comment? ──
         if session.get("awaiting_comment"):
             if lower == "skip":
+                logger.info(f"[ROUTE] customer={customer_id} path=RATING_SKIP")
                 ac = session["awaiting_comment"]
                 return await self._finalize_rating(customer_id, ac["score"], None, ac["pharmacy_id"])
             else:
+                logger.info(f"[ROUTE] customer={customer_id} path=RATING_COMMENT text={text[:80]!r}")
                 ac = session["awaiting_comment"]
                 return await self._finalize_rating(customer_id, ac["score"], text, ac["pharmacy_id"])
 
@@ -427,51 +448,72 @@ class WhatsAppService:
             num = int(lower)
             results = session.get("search_results")
             if results and 1 <= num <= len(results):
+                logger.info(f"[ROUTE] customer={customer_id} path=SELECT_RESULT num={num} pharmacy={results[num-1]}")
                 return await self._show_pharmacy_detail(customer_id, results[num - 1])
             # If no active results and 1-3, treat as menu
             if num == 0:
+                logger.info(f"[ROUTE] customer={customer_id} path=GLOBAL_MENU input='0'")
                 return [_text(self.WELCOME)]
             if num == 1 and not results:
+                logger.info(f"[ROUTE] customer={customer_id} path=MENU_1_FIND (no results)")
                 return [_text(self.SEARCH_PROMPT)]
             if num == 2 and not results:
+                logger.info(f"[ROUTE] customer={customer_id} path=MENU_2_NEARBY (no results)")
                 return [_text(self.NEAR_ME_PROMPT)]
             if num == 3 and not results:
+                logger.info(f"[ROUTE] customer={customer_id} path=MENU_3_SAVED (no results)")
                 return await self._show_saved_pharmacies(customer_id)
             # Out of range
             if results:
+                logger.info(f"[ROUTE] customer={customer_id} path=NUM_OUT_OF_RANGE num={num} max={len(results)}")
                 return [_text(f"Please pick a number from 1 to {len(results)}.\n\n_Reply *0* for main menu_")]
+            logger.info(f"[ROUTE] customer={customer_id} path=NUM_NO_CONTEXT num={num}")
             return [_text(self.WELCOME)]
 
         # ── 8. Greetings ──
         if lower in ("hi", "hello", "hey", "start", "hie", "yo"):
+            logger.info(f"[ROUTE] customer={customer_id} path=GREETING input={lower!r}")
             return [_text(self.WELCOME)]
 
         # ── 9. Explicit commands ──
         if lower in ("find", "find medicine", "search", "1️⃣"):
+            logger.info(f"[ROUTE] customer={customer_id} path=CMD_FIND")
             return [_text(self.SEARCH_PROMPT)]
         if lower in ("near me", "nearby", "2️⃣", "pharmacies near me"):
+            logger.info(f"[ROUTE] customer={customer_id} path=CMD_NEARBY")
             return [_text(self.NEAR_ME_PROMPT)]
         if lower in ("saved", "my saved", "3️⃣", "my saved pharmacies"):
+            logger.info(f"[ROUTE] customer={customer_id} path=CMD_SAVED")
             return await self._show_saved_pharmacies(customer_id)
         if lower in ("save",):
+            logger.info(f"[ROUTE] customer={customer_id} path=CMD_SAVE")
             return await self._save_current_pharmacy(customer_id, session)
         if lower in ("rate",):
+            logger.info(f"[ROUTE] customer={customer_id} path=CMD_RATE")
             return await self._show_rating_prompt(customer_id, session)
 
         # ── 10. Rate N [comment] ──
         if lower.startswith("rate "):
+            logger.info(f"[ROUTE] customer={customer_id} path=RATE_CMD input={text!r}")
             return await self._handle_rate_command(customer_id, text, session)
 
-        # ── 11. Pharmacy search: "pharmacy Avondale" ──
-        if lower.startswith("pharmacy ") or lower.startswith("find pharmacy"):
-            query = text.split(" ", 1)[1] if " " in text else ""
-            return await self._search_pharmacies(customer_id, query.strip())
+        # ── 11. Pharmacy search: "pharmacy Avondale" or just "pharmacy" ──
+        if lower == "pharmacy" or lower.startswith("pharmacy "):
+            query = text[len("pharmacy"):].strip()
+            logger.info(f"[ROUTE] customer={customer_id} path=PHARMACY_SEARCH query={query!r}")
+            return await self._search_pharmacies(customer_id, query)
+        if lower.startswith("find pharmacy"):
+            query = text[len("find pharmacy"):].strip()
+            logger.info(f"[ROUTE] customer={customer_id} path=PHARMACY_SEARCH query={query!r}")
+            return await self._search_pharmacies(customer_id, query)
 
         # ── 12. Symptom detection → LLM → medicine search ──
         if _is_symptom_text(text):
+            logger.info(f"[ROUTE] customer={customer_id} path=SYMPTOM_LLM text={text[:80]!r}")
             return await self._handle_symptoms(customer_id, text)
 
         # ── 13. Default: treat as medicine name search ──
+        logger.info(f"[ROUTE] customer={customer_id} path=MEDICINE_SEARCH text={text[:80]!r}")
         return await self._search_medicines(customer_id, [text], text)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -593,6 +635,8 @@ class WhatsAppService:
             "score": score,
             "comment": comment,
         })
+        # Clear awaiting_comment from session so next message isn't captured
+        await _save_session(customer_id, {"awaiting_comment": None})
         pharmacy = await db.get_pharmacy_details(pharmacy_id)
         name = pharmacy.get("name", "the pharmacy") if pharmacy else "the pharmacy"
         msg = f"✅ You rated *{name}* {_stars(score)}"
