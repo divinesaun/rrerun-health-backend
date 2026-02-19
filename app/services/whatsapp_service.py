@@ -1,27 +1,28 @@
 """
-WhatsApp conversation orchestrator.
+WhatsApp conversation orchestrator — built from scratch.
 
-State machine flow:
-  STATE 1 — MAIN MENU (welcome, numbered options)
-  STATE 2 — MEDICINE SEARCH (plain name, symptom via LLM, image via OCR, bulk list)
-  STATE 3 — RESULTS LIST (ranked pharmacies with stock info)
-  STATE 4 — PHARMACY DETAIL (location pin + info card + CTA buttons)
-  STATE 5 — RATING (1-5, optional comment)
+Session state is persisted in conversation_history as system messages.
+The routing order is critical — session-aware checks come BEFORE menu options
+so that numbers select from active results instead of triggering menu items.
 
-Global rules:
-  - 0 / menu / home / back → main menu from any state
-  - help / ? → help message
-  - GPS location pin → save coords
-  - Max 2 messages per bot turn
-  - Every message ends with an italic next-step hint
-
-Response format: Each handler returns a list of message actions:
-  [{"type": "text", "body": "..."}, {"type": "interactive", "template": "welcome"}, ...]
+Routing priority (strict order):
+  1. Global commands: 0/menu/home/back → welcome
+  2. Global commands: help/? → help
+  3. Media → download with Twilio auth → OCR → LLM → search
+  4. Location detection: Google Maps URL / coordinates → search nearby
+  5. Session state: awaiting_comment → handle comment
+  6. Active results + digit → select pharmacy from results
+  7. Pharmacy detail commands: rate/save/back
+  8. Greetings: hi/hello/hey/start
+  9. Text commands: find/near me/saved/pharmacy X
+  10. Symptom detection via LLM → extract medicine names → search
+  11. Default: treat as medicine name → search directly
 """
 
 import json
+import re
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -37,35 +38,43 @@ CAT = timezone(timedelta(hours=2))
 DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-RATING_LABELS = {1: "Poor", 2: "Below average", 3: "Average", 4: "Good", 5: "Excellent"}
+# Regex to detect Google Maps URLs or raw coordinates
+_LOCATION_RE = re.compile(
+    r"(?:location:\s*)?(?:https?://(?:www\.)?(?:google\.com/maps|maps\.google\.com|goo\.gl/maps)\S*[?&]q?=?(-?\d+\.?\d*),\s*(-?\d+\.?\d*))"
+    r"|(-?\d{1,3}\.\d{3,}),\s*(-?\d{1,3}\.\d{3,})",
+    re.IGNORECASE,
+)
 
-# ── Response builder helpers ─────────────────────────────────────────────
+# Simple symptom keywords — if message contains these AND no obvious medicine name, use LLM
+_SYMPTOM_WORDS = {
+    "headache", "pain", "fever", "cold", "flu", "cough", "sore throat",
+    "allergy", "allergies", "stomach", "nausea", "vomiting", "diarrhea",
+    "infection", "swelling", "rash", "itch", "itching", "dizzy", "tired",
+    "ache", "hurt", "burning", "cramp", "cramps", "runny nose", "blocked nose",
+    "chest pain", "back pain", "toothache", "earache", "heartburn",
+    "i have", "i need something for", "what can i take", "feeling",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Response builder helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _text(body: str) -> dict:
-    """Plain text message action."""
     return {"type": "text", "body": body}
 
-def _interactive(template: str) -> dict:
-    """Interactive template message action (quick-reply buttons)."""
-    return {"type": "interactive", "template": template}
-
 def _location(lat: float, lng: float, label: str, address: str = "") -> dict:
-    """Location message action."""
     return {"type": "location", "lat": lat, "lng": lng, "label": label, "address": address}
 
-def _cta(body: str, actions: list) -> dict:
-    """Call-to-action message action (phone/URL buttons)."""
-    return {"type": "cta", "body": body, "actions": actions}
-
 def _stars(score: int) -> str:
-    """Return star emoji string for a rating score."""
     return "⭐" * score
 
 
-# ── Opening hours helpers ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Opening hours helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _parse_opening_hours(raw) -> Optional[dict]:
-    """Parse opening_hours from JSONB (dict or JSON string) to a WeekSchedule dict."""
     if not raw:
         return None
     if isinstance(raw, dict):
@@ -81,7 +90,6 @@ def _parse_opening_hours(raw) -> Optional[dict]:
 
 
 def _is_pharmacy_open(hours_data: Optional[dict]) -> Optional[bool]:
-    """Check if pharmacy is currently open based on CAT time."""
     if not hours_data:
         return None
     now = datetime.now(CAT)
@@ -97,7 +105,6 @@ def _is_pharmacy_open(hours_data: Optional[dict]) -> Optional[bool]:
 
 
 def _fmt_time_12h(t: str) -> str:
-    """Convert 24h time string to 12h format."""
     try:
         h, m = t.split(":")
         hour = int(h)
@@ -108,36 +115,7 @@ def _fmt_time_12h(t: str) -> str:
         return t
 
 
-def _fmt_opening_hours_short(hours_data: Optional[dict]) -> str:
-    """Format opening hours as a compact string for WhatsApp."""
-    if not hours_data:
-        return ""
-    groups = []
-    closed_days = []
-    for day_key, idx in DAY_MAP.items():
-        d = hours_data.get(day_key, {})
-        if not d.get("open"):
-            closed_days.append(DAY_LABELS[idx])
-            continue
-        frm, to = d.get("from", "08:00"), d.get("to", "17:00")
-        last = groups[-1] if groups else None
-        if last and last["from"] == frm and last["to"] == to:
-            last["days"].append(DAY_LABELS[idx])
-        else:
-            groups.append({"days": [DAY_LABELS[idx]], "from": frm, "to": to})
-
-    parts = []
-    for g in groups:
-        day_range = f"{g['days'][0]}-{g['days'][-1]}" if len(g["days"]) > 2 else ", ".join(g["days"])
-        parts.append(f"{day_range}: {_fmt_time_12h(g['from'])}-{_fmt_time_12h(g['to'])}")
-    if closed_days:
-        cd = f"{closed_days[0]}-{closed_days[-1]}" if len(closed_days) > 2 else ", ".join(closed_days)
-        parts.append(f"{cd}: Closed")
-    return " | ".join(parts)
-
-
 def _fmt_opening_hours_detail(hours_data: Optional[dict]) -> str:
-    """Format opening hours line-by-line for pharmacy detail view."""
     if not hours_data:
         return ""
     lines = []
@@ -145,19 +123,17 @@ def _fmt_opening_hours_detail(hours_data: Optional[dict]) -> str:
         d = hours_data.get(day_key, {})
         label = DAY_LABELS[idx]
         if d.get("open"):
-            lines.append(f"  {label}  {_fmt_time_12h(d.get('from', '08:00'))} - {_fmt_time_12h(d.get('to', '17:00'))}")
+            lines.append(f"  {label}  {_fmt_time_12h(d.get('from', '08:00'))} – {_fmt_time_12h(d.get('to', '17:00'))}")
         else:
             lines.append(f"  {label}  Closed")
     return "\n".join(lines)
 
 
 def _open_status_badge(hours_data: Optional[dict]) -> str:
-    """Return open/closed badge."""
     is_open = _is_pharmacy_open(hours_data)
     if is_open is True:
         return "🟢 Open Now"
     elif is_open is False:
-        # Find next opening time
         if hours_data:
             now = datetime.now(CAT)
             keys = list(DAY_MAP.keys())
@@ -171,7 +147,6 @@ def _open_status_badge(hours_data: Optional[dict]) -> str:
 
 
 def _stock_badge(in_stock, qty) -> str:
-    """Return stock status badge."""
     if not in_stock:
         return "❌ Out of Stock"
     try:
@@ -179,102 +154,66 @@ def _stock_badge(in_stock, qty) -> str:
     except (ValueError, TypeError):
         q = None
     if q is not None and q <= 5:
-        return f"⚠️ Limited Stock ({q} left)"
+        return f"⚠️ Low Stock ({q} left)"
     if q is not None:
-        return f"✅ In Stock ({q}+ available)"
+        return f"✅ In Stock ({q}+)"
     return "✅ In Stock"
 
 
-def _payment_icons(p: dict) -> str:
-    """Build payment method icons from pharmacy data."""
-    methods = []
-    methods.append("💵 Cash")
-    if p.get("accepts_medical_aid"):
-        methods.append("💳 Medical Aid")
-    if p.get("has_delivery"):
-        methods.append("🚚 Delivery")
-    return ", ".join(methods) if methods else ""
+def _is_symptom_text(text: str) -> bool:
+    """Heuristic: does this look like a symptom description rather than a medicine name?"""
+    lower = text.lower()
+    for kw in _SYMPTOM_WORDS:
+        if kw in lower:
+            return True
+    return False
 
 
-# ── Ranking helper ────────────────────────────────────────────────────────
+def _extract_location(text: str) -> Optional[Tuple[float, float]]:
+    """Try to extract lat,lng from a Google Maps URL or raw coordinates."""
+    m = _LOCATION_RE.search(text)
+    if m:
+        lat = m.group(1) or m.group(3)
+        lng = m.group(2) or m.group(4)
+        if lat and lng:
+            try:
+                return float(lat), float(lng)
+            except ValueError:
+                pass
+    return None
 
-def _rank_pharmacy_results(results: list) -> list:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Message formatting
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _fmt_pharmacy_line(idx: int, p: dict, medicines_info: list = None) -> str:
+    """Format a single pharmacy in the results list.
+
+    medicines_info: optional list of dicts with keys name, price, in_stock, quantity_available
     """
-    Rank pharmacies by priority:
-    1. Open Now (open first, closed last)
-    2. Price (lowest first)
-    3. Distance (if available)
-    4. Stock availability (in-stock first, limited next, out-of-stock last)
-    """
-    def sort_key(inv):
-        p = inv.get("pharmacies") or inv
-        hours_data = _parse_opening_hours(p.get("opening_hours"))
-        is_open = _is_pharmacy_open(hours_data)
-
-        # Priority 1: Open status (True=0, None=1, False=2)
-        open_score = 0 if is_open is True else (2 if is_open is False else 1)
-
-        # Priority 2: Price
-        try:
-            price = float(inv.get("price", 9999))
-        except (ValueError, TypeError):
-            price = 9999
-
-        # Priority 3: Distance
-        dist = p.get("distance_km") or 999
-
-        # Priority 4: Stock
-        in_stock = inv.get("in_stock", True)
-        try:
-            qty = int(inv.get("quantity_available", 0) or 0)
-        except (ValueError, TypeError):
-            qty = 0
-        stock_score = 0 if (in_stock and qty > 5) else (1 if in_stock else 2)
-
-        return (open_score, price, dist, stock_score)
-
-    return sorted(results, key=sort_key)
-
-
-# ── Message formatting ────────────────────────────────────────────────────
-
-def _fmt_pharmacy_line(idx: int, p: dict, inv: dict = None) -> str:
-    """Format a single pharmacy result line — professional WhatsApp layout."""
     hours_data = _parse_opening_hours(p.get("opening_hours"))
     status = _open_status_badge(hours_data)
 
-    lines = [f"{idx}. {status} *{p.get('name', 'Unknown')}*" if status else f"{idx}. *{p.get('name', 'Unknown')}*"]
+    header = f"{idx}. {status} *{p.get('name', 'Unknown')}*" if status else f"{idx}. *{p.get('name', 'Unknown')}*"
+    lines = [header]
 
-    details = []
-    if inv:
-        price = inv.get("price", "—")
-        in_stock = inv.get("in_stock", True)
-        qty = inv.get("quantity_available", "")
-        details.append(f"� ${price}")
-        details.append(_stock_badge(in_stock, qty))
-    if details:
-        lines.append(f"   {' | '.join(details)}")
+    # Medicine lines (when grouped by pharmacy)
+    if medicines_info:
+        for mi in medicines_info:
+            price_str = f"${mi['price']}" if mi.get("price") is not None else ""
+            stock_str = _stock_badge(mi.get("in_stock", True), mi.get("quantity_available"))
+            lines.append(f"   💊 {mi['name']} — {price_str} {stock_str}")
 
-    # Location
-    loc_parts = []
-    dist = p.get("distance_km")
-    if dist is not None:
-        loc_parts.append(f"{dist} km away")
+    # Address
     addr = p.get("address", "")
     suburb = p.get("suburb", "")
     loc_str = ", ".join(filter(None, [addr, suburb]))
     if loc_str:
-        loc_parts.append(loc_str)
-    if loc_parts:
-        lines.append(f"   📍 {' · '.join(loc_parts)}")
-
-    # Payment / services
-    pay = _payment_icons(p)
-    if pay:
-        lines.append(f"   {pay}")
+        lines.append(f"   📍 {loc_str}")
 
     # Phone
-    phone = p.get("whatsapp_number") or p.get("phone")
+    phone = p.get("phone") or p.get("whatsapp_number")
     if phone:
         lines.append(f"   📞 {phone}")
 
@@ -282,7 +221,7 @@ def _fmt_pharmacy_line(idx: int, p: dict, inv: dict = None) -> str:
 
 
 def _fmt_pharmacy_detail(p: dict) -> str:
-    """Format a full pharmacy detail card — matches system prompt spec."""
+    """Format the full pharmacy detail card."""
     hours_data = _parse_opening_hours(p.get("opening_hours"))
     status = _open_status_badge(hours_data)
 
@@ -294,19 +233,22 @@ def _fmt_pharmacy_detail(p: dict) -> str:
     # Address + Maps link
     loc = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", ""), p.get("city", "")]))
     if loc:
-        lines.append("*📍 Address*")
         lat, lng = p.get("latitude"), p.get("longitude")
         if lat and lng:
-            lines.append(f"{loc}")
+            lines.append(f"📍 {loc}")
             lines.append(f"🗺️ https://maps.google.com/?q={lat},{lng}")
         else:
-            lines.append(loc)
+            lines.append(f"📍 {loc}")
         lines.append("")
 
     # Phone
     phone = p.get("phone")
     if phone:
-        lines.append(f"� {phone}")
+        lines.append(f"📞 {phone}")
+    wa = p.get("whatsapp_number")
+    if wa and wa != phone:
+        lines.append(f"💬 wa.me/{wa.strip().replace(' ', '').replace('+', '')}")
+    if phone or wa:
         lines.append("")
 
     # Opening Hours
@@ -318,104 +260,85 @@ def _fmt_pharmacy_detail(p: dict) -> str:
     # Services — only show TRUE flags
     services = []
     if p.get("accepts_medical_aid"):
-        services.append("🏥 Accepts Medical Aid")
-    if p.get("parking_available"):
-        services.append("� Parking Available")
+        services.append("💳 Accepts Medical Aid")
     if p.get("has_delivery"):
-        services.append("� Delivery Available")
+        services.append("🚚 Delivery Available")
     if p.get("is_24_hours"):
-        services.append("� Open 24 Hours")
+        services.append("🌙 Open 24 Hours")
+    if p.get("parking_available"):
+        services.append("🅿️ Parking Available")
     special = p.get("special_services")
     if special:
         services.append(f"ℹ️ {special}")
     if services:
-        lines.append("*ℹ️ Services*")
         for s in services:
             lines.append(s)
         lines.append("")
 
-    # Links — only show non-null
-    links = []
-    website = p.get("website")
-    if website:
-        links.append(f"🌐 {website}")
-    fb = p.get("facebook")
-    if fb:
-        links.append(f"📘 {fb}")
-    ig = p.get("instagram")
-    if ig:
-        links.append(f"📸 {ig}")
-    wa = p.get("whatsapp_number")
-    if wa:
-        wa_clean = wa.strip().replace(" ", "").replace("+", "")
-        links.append(f"💬 wa.me/{wa_clean}")
-    if links:
-        lines.append("*🌐 Links*")
-        for lnk in links:
-            lines.append(lnk)
+    # Rating
+    rating = p.get("rating")
+    reviews = p.get("total_reviews", 0)
+    if rating:
+        full = int(float(rating))
+        lines.append(f"{'⭐' * full} {rating}/5 ({reviews} review{'s' if reviews != 1 else ''})")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("Reply *rate* to rate · *save* to save · *back* for list")
+    lines.append("_*rate 1-5* to rate · *save* to bookmark_")
+    lines.append("_Type a medicine name to search again_")
     lines.append("_Reply *0* for main menu_")
     return "\n".join(lines)
 
 
-def _fmt_medicine_results(medicine_name: str, pharmacies: list) -> str:
-    """Format medicine search results — ranked, grouped by open/closed."""
-    if not pharmacies:
-        return (
-            f"😔 *{medicine_name}*\n"
-            "No results found.\n\n"
-            "Try a different spelling, the generic name, or describe your symptoms.\n\n"
-            "_Reply *0* for main menu_"
-        )
+# ═══════════════════════════════════════════════════════════════════════════
+# Session state helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
-    ranked = _rank_pharmacy_results(pharmacies)
-    count = len(ranked)
+async def _save_session(customer_id: str, data: dict) -> None:
+    """Write a session state marker into conversation history."""
+    await db.save_conversation_message({
+        "customer_id": customer_id,
+        "role": "system",
+        "content": json.dumps(data),
+    })
 
-    # Group by open/closed
-    open_items = []
-    closed_items = []
-    for inv in ranked[:5]:
-        p = inv.get("pharmacies") or inv
-        hours_data = _parse_opening_hours(p.get("opening_hours"))
-        is_open = _is_pharmacy_open(hours_data)
-        if is_open is False:
-            closed_items.append(inv)
-        else:
-            open_items.append(inv)
 
-    lines = [f"💊 *{count} pharmacy{'ies' if count != 1 else ''}* with *{medicine_name}*\n"]
+async def _read_session(customer_id: str) -> dict:
+    """Read the most recent session state from conversation history.
 
-    idx = 1
-    if open_items:
-        lines.append("🟢 *Open Now*")
-        for inv in open_items:
-            p = inv.get("pharmacies") or inv
-            lines.append(_fmt_pharmacy_line(idx, p, inv=inv))
-            lines.append("")
-            idx += 1
+    Returns a dict that may contain keys:
+      search_results  — list of pharmacy IDs from last search
+      viewing_pharmacy — pharmacy ID currently being viewed
+      awaiting_comment — {score, pharmacy_id} if waiting for rating comment
+    """
+    rows = await db.get_conversation_history(customer_id, limit=20)
+    state = {}
+    for msg in reversed(rows):
+        if msg.get("role") != "system":
+            continue
+        try:
+            data = json.loads(msg.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        # Pick up the first (most recent) of each key we find
+        if "search_results" in data and "search_results" not in state:
+            state["search_results"] = data["search_results"]
+        if "viewing_pharmacy" in data and "viewing_pharmacy" not in state:
+            state["viewing_pharmacy"] = data["viewing_pharmacy"]
+        if "awaiting_comment" in data and "awaiting_comment" not in state:
+            state["awaiting_comment"] = data["awaiting_comment"]
+        # Stop early once we have everything
+        if all(k in state for k in ("search_results", "viewing_pharmacy")):
+            break
+    return state
 
-    if closed_items:
-        lines.append("🔴 *Closed*")
-        for inv in closed_items:
-            p = inv.get("pharmacies") or inv
-            lines.append(_fmt_pharmacy_line(idx, p, inv=inv))
-            lines.append("")
-            idx += 1
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_Reply with a number for full details_")
-    lines.append("_Type a new medicine name to search again_")
-    lines.append("_Reply *0* for main menu_")
-    return "\n".join(lines)
-
+# ═══════════════════════════════════════════════════════════════════════════
+# WhatsApp Service — the main class
+# ═══════════════════════════════════════════════════════════════════════════
 
 class WhatsAppService:
-    """Orchestrates the WhatsApp conversation flow — state machine."""
 
-    # ── Welcome message text ────────────────────────────────────────────
     WELCOME = (
         "👋 *Welcome to RERUN Health!*\n"
         "I help you find medicines at pharmacies near you.\n\n"
@@ -423,36 +346,40 @@ class WhatsAppService:
         "1️⃣ 💊 Find a medicine\n"
         "2️⃣ 📍 Pharmacies near me\n"
         "3️⃣ 💾 My saved pharmacies\n\n"
-        "_Or just tell me what you're looking for!_\n"
+        "_Just type a medicine name to get started!_\n"
         "_Reply *0* anytime for this menu_"
     )
 
     HELP = (
-        "ℹ️ *RERUN Health — Help*\n"
+        "ℹ️ *RERUN Health — Quick Guide*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💊 *Find Medicine* — Type any medicine name\n"
-        "📍 *Near Me* — Find pharmacies in your area\n"
-        "💾 *Saved* — View your saved pharmacies\n"
-        "📸 *Photo* — Send a prescription photo\n"
-        "⭐ *Rate* — Rate a pharmacy after viewing\n"
-        "💾 *Save* — Save a pharmacy you're viewing\n\n"
-        "_Just type what you need!_\n"
+        "💊 Type any *medicine name* to search\n"
+        "🤒 Describe *symptoms* and I'll suggest medicines\n"
+        "📸 Send a *prescription photo* to scan\n"
+        "📍 Type *pharmacy [area]* to find nearby\n"
+        "⭐ Type *rate 1-5* after viewing a pharmacy\n"
+        "💾 Type *save* to bookmark a pharmacy\n\n"
         "_Reply *0* for main menu_"
     )
 
     SEARCH_PROMPT = (
-        "💊 *What medicine are you looking for?*\n\n"
-        "Type a medicine name, describe symptoms, or send a photo.\n\n"
-        "_e.g. paracetamol, \"I have a headache\", amoxicillin 500mg_\n"
+        "💊 *What medicine do you need?*\n\n"
+        "You can:\n"
+        "• Type a medicine name (e.g. _paracetamol_)\n"
+        "• Describe symptoms (e.g. _I have a headache_)\n"
+        "• Send a prescription 📸 photo\n\n"
         "_Reply *0* for main menu_"
     )
 
-    LOCATION_PROMPT = (
+    NEAR_ME_PROMPT = (
         "📍 *Find pharmacies near you*\n\n"
-        "Send your location pin 📌 or type an area name.\n\n"
-        "_e.g. Avondale, Borrowdale, City Centre_\n"
+        "Type an area name, e.g.:\n"
+        "  _pharmacy Avondale_\n"
+        "  _pharmacy Borrowdale_\n\n"
         "_Reply *0* for main menu_"
     )
+
+    # ── Main entry point ─────────────────────────────────────────────────
 
     async def process_message(
         self,
@@ -461,213 +388,259 @@ class WhatsAppService:
         media_url: Optional[str] = None,
         history: Optional[List[dict]] = None,
     ) -> List[dict]:
-        """Main entry point. Returns a list of message actions to send (max 2)."""
-
-        # ── Prescription / medicine image ──
-        if media_url:
-            return await self._handle_prescription(customer_id, media_url, message)
+        """Route incoming message and return list of text/location actions."""
 
         text = message.strip()
         lower = text.lower()
 
-        # ── GLOBAL RULES — always active ──
-        if lower in ("0", "menu", "home", "back", "main menu", "🏠 main menu", "📋 menu"):
+        # ── 1. GLOBAL: menu / back ──
+        if lower in ("0", "menu", "home", "back", "main menu"):
             return [_text(self.WELCOME)]
-        if lower in ("help", "?", "❓ help"):
+
+        # ── 2. GLOBAL: help ──
+        if lower in ("help", "?"):
             return [_text(self.HELP)]
 
-        # ── STATE 1 — Main menu triggers ──
-        if lower in ("hi", "hello", "hey", "start", "hie"):
+        # ── 3. Media → OCR pipeline ──
+        if media_url:
+            return await self._handle_image(customer_id, media_url)
+
+        # ── 4. Location detection ──
+        coords = _extract_location(text)
+        if coords:
+            return await self._handle_location(customer_id, coords)
+
+        # ── 5. Read session state for context-aware routing ──
+        session = await _read_session(customer_id)
+
+        # ── 6. Awaiting rating comment? ──
+        if session.get("awaiting_comment"):
+            if lower == "skip":
+                ac = session["awaiting_comment"]
+                return await self._finalize_rating(customer_id, ac["score"], None, ac["pharmacy_id"])
+            else:
+                ac = session["awaiting_comment"]
+                return await self._finalize_rating(customer_id, ac["score"], text, ac["pharmacy_id"])
+
+        # ── 7. Number input — context-aware ──
+        if lower.isdigit():
+            num = int(lower)
+            results = session.get("search_results")
+            if results and 1 <= num <= len(results):
+                return await self._show_pharmacy_detail(customer_id, results[num - 1])
+            # If no active results and 1-3, treat as menu
+            if num == 0:
+                return [_text(self.WELCOME)]
+            if num == 1 and not results:
+                return [_text(self.SEARCH_PROMPT)]
+            if num == 2 and not results:
+                return [_text(self.NEAR_ME_PROMPT)]
+            if num == 3 and not results:
+                return await self._show_saved_pharmacies(customer_id)
+            # Out of range
+            if results:
+                return [_text(f"Please pick a number from 1 to {len(results)}.\n\n_Reply *0* for main menu_")]
             return [_text(self.WELCOME)]
-        if lower in ("1", "find", "find medicine", "💊", "find a medicine", "💊 find medicine"):
+
+        # ── 8. Greetings ──
+        if lower in ("hi", "hello", "hey", "start", "hie", "yo"):
+            return [_text(self.WELCOME)]
+
+        # ── 9. Explicit commands ──
+        if lower in ("find", "find medicine", "search", "1️⃣"):
             return [_text(self.SEARCH_PROMPT)]
-        if lower in ("2", "near me", "nearby", "�", "📍 near me", "pharmacies near me"):
-            return [_text(self.LOCATION_PROMPT)]
-        if lower in ("3", "saved", "💾", "my saved", "💾 my saved pharmacies"):
-            return await self._handle_saved_pharmacies(customer_id)
+        if lower in ("near me", "nearby", "2️⃣", "pharmacies near me"):
+            return [_text(self.NEAR_ME_PROMPT)]
+        if lower in ("saved", "my saved", "3️⃣", "my saved pharmacies"):
+            return await self._show_saved_pharmacies(customer_id)
+        if lower in ("save",):
+            return await self._save_current_pharmacy(customer_id, session)
+        if lower in ("rate",):
+            return await self._show_rating_prompt(customer_id, session)
 
-        # ── Quick reply button responses ──
-        if lower in ("scan rx", "📸 scan rx"):
-            return [_text("📸 Send a photo of your prescription and I'll identify the medicines for you.\n\n_Reply *0* for main menu_")]
-        if lower in ("rate", "⭐ rate"):
-            return await self._show_rating_prompt(customer_id)
-        if lower in ("save", "💾 save"):
-            return await self._handle_save_pharmacy(customer_id)
-
-        # ── Rating quick reply responses ──
-        if lower in ("⭐⭐⭐⭐⭐ (5)", "rate_5"):
-            return await self._handle_rating(customer_id, 5, history)
-        if lower in ("⭐⭐⭐⭐ (4)", "rate_4"):
-            return await self._handle_rating(customer_id, 4, history)
-        if lower in ("⭐⭐⭐ (3)", "rate_3"):
-            return await self._handle_rating(customer_id, 3, history)
-
-        # ── Rating (typed) — "rate 4" or "rate 5 great service" ──
+        # ── 10. Rate N [comment] ──
         if lower.startswith("rate "):
-            parts = text.split(None, 2)
-            try:
-                score = int(parts[1])
-                if 1 <= score <= 5:
-                    comment = parts[2] if len(parts) > 2 else None
-                    return await self._handle_rating(customer_id, score, history, comment=comment)
-            except (IndexError, ValueError):
-                pass
-            return await self._show_rating_prompt(customer_id)
+            return await self._handle_rate_command(customer_id, text, session)
 
-        # ── Skip (rating comment skip) ──
-        if lower == "skip":
-            state = await self._get_session_state(customer_id)
-            if state and state.get("awaiting_comment"):
-                return await self._finalize_rating(customer_id, state["awaiting_comment"]["score"], None, state["awaiting_comment"]["pharmacy_id"])
-            return [_text(self.WELCOME)]
-
-        # ── Numeric selection (picking from results) ──
-        if lower.isdigit() and int(lower) > 0:
-            return await self._handle_selection(customer_id, int(lower), history)
-
-        # ── Pharmacy search ──
+        # ── 11. Pharmacy search: "pharmacy Avondale" ──
         if lower.startswith("pharmacy ") or lower.startswith("find pharmacy"):
             query = text.split(" ", 1)[1] if " " in text else ""
-            return await self._handle_pharmacy_search(customer_id, query.strip())
+            return await self._search_pharmacies(customer_id, query.strip())
 
-        # ── New search (quick reply button) ──
-        if lower in ("new search", "🔍 new search"):
-            return [_text(self.SEARCH_PROMPT)]
+        # ── 12. Symptom detection → LLM → medicine search ──
+        if _is_symptom_text(text):
+            return await self._handle_symptoms(customer_id, text)
 
-        # ── Check if user is submitting a rating comment ──
-        state = await self._get_session_state(customer_id)
-        if state and state.get("awaiting_comment"):
-            ac = state["awaiting_comment"]
-            return await self._finalize_rating(customer_id, ac["score"], text, ac["pharmacy_id"])
+        # ── 13. Default: treat as medicine name search ──
+        return await self._search_medicines(customer_id, [text], text)
 
-        # ── Fallback: treat as medicine search or use AI ──
-        return await self._handle_ai_intent(customer_id, text, history)
+    # ═══════════════════════════════════════════════════════════════════════
+    # Handlers
+    # ═══════════════════════════════════════════════════════════════════════
 
-    # ── Handlers ────────────────────────────────────────────────────────────
-
-    async def _handle_prescription(self, customer_id: str, media_url: str, message: str) -> List[dict]:
-        """Process a prescription image via OCR + AI extraction."""
+    async def _handle_image(self, customer_id: str, media_url: str) -> List[dict]:
+        """OCR → LLM extract medicines → search."""
         try:
             raw_text = ocr_service.extract_text_from_url(media_url)
-            logger.info(f"[OCR] user_id={customer_id} extracted=\"{raw_text[:200]}\"")
+            logger.info(f"[OCR] customer={customer_id} text={raw_text[:300]!r}")
+
             if not raw_text.strip():
                 return [_text(
-                    "� I couldn't read the image clearly. Please type the medicine name instead.\n\n"
+                    "📸 I received your image but couldn't read any text.\n\n"
+                    "Please type the medicine names instead.\n\n"
                     "_Reply *0* for main menu_"
                 )]
 
+            # LLM: extract medicine names from OCR text
             parsed = stepfun_service.extract_medicines_from_ocr_text(raw_text)
-            medicines = [m["name"] if isinstance(m, dict) else m for m in parsed]
+            medicines = [m["name"] if isinstance(m, dict) else str(m) for m in parsed if m]
+            logger.info(f"[OCR→LLM] customer={customer_id} medicines={medicines}")
+
+            if not medicines:
+                # Fallback: try extract_medicines_from_text (simpler prompt)
+                medicines = stepfun_service.extract_medicines_from_text(raw_text)
+                logger.info(f"[OCR→LLM fallback] medicines={medicines}")
 
             if not medicines:
                 return [_text(
-                    "� I couldn't read the image clearly. Please type the medicine name instead.\n\n"
+                    "📸 I scanned your image but couldn't identify specific medicines.\n\n"
+                    "Please type the medicine names manually.\n\n"
                     "_Reply *0* for main menu_"
                 )]
 
-            names_str = ", ".join(f"*{m}*" for m in medicines)
-            return [
-                _text(f"📸 I scanned your image and found: {names_str}. Searching..."),
-            ] + await self._search_and_format_medicines(customer_id, medicines, "[prescription scan]")
+            # Search
+            names_str = ", ".join(f"*{m}*" for m in medicines[:5])
+            search_results = await self._search_medicines(customer_id, medicines[:5], "[prescription scan]")
+            return [_text(f"📸 Found from your image: {names_str}\n\nSearching...")] + search_results
 
         except Exception as e:
-            logger.error(f"Prescription processing error: {e}")
+            logger.error(f"Image processing error for {customer_id}: {e}", exc_info=True)
             return [_text(
-                "😔 I couldn't read the image clearly. Please type the medicine name instead.\n\n"
+                "📸 Sorry, I had trouble reading that image.\n\n"
+                "Please type the medicine names instead.\n\n"
                 "_Reply *0* for main menu_"
             )]
 
-    async def _show_rating_prompt(self, customer_id: str) -> List[dict]:
-        """Show the rating selection prompt."""
-        pharmacy_id = await self._get_last_viewed_pharmacy(customer_id)
-        if not pharmacy_id:
+    async def _handle_location(self, customer_id: str, coords: Tuple[float, float]) -> List[dict]:
+        """User shared a location — search pharmacies nearby."""
+        lat, lng = coords
+        logger.info(f"[LOCATION] customer={customer_id} lat={lat} lng={lng}")
+
+        # Save coords on the customer record for distance sorting
+        try:
+            await db.update_customer(customer_id, {"latitude": lat, "longitude": lng})
+        except Exception as e:
+            logger.warning(f"Failed to save customer location: {e}")
+
+        # Search pharmacies near the area
+        results = await db.search_pharmacies_by_area("")
+        if not results:
             return [_text(
-                "Please view a pharmacy first, then reply *rate*.\n\n"
+                "📍 Got your location! But I couldn't find pharmacies nearby.\n\n"
+                "Try typing *pharmacy [area name]* instead.\n\n"
                 "_Reply *0* for main menu_"
             )]
-        pharmacy = await db.get_pharmacy_by_id(pharmacy_id)
-        name = pharmacy.get("name", "this pharmacy") if pharmacy else "this pharmacy"
+
+        return await self._format_pharmacy_results(customer_id, results[:5], "your location 📍")
+
+    async def _handle_symptoms(self, customer_id: str, text: str) -> List[dict]:
+        """Use LLM to extract medicine names from symptom description, then search."""
+        try:
+            medicines = stepfun_service.extract_medicines_from_text(text)
+            logger.info(f"[SYMPTOMS→LLM] customer={customer_id} text={text!r} medicines={medicines}")
+
+            if medicines:
+                return await self._search_medicines(customer_id, medicines, text)
+        except Exception as e:
+            logger.error(f"Symptom LLM error: {e}")
+
+        # Fallback: tell user we couldn't understand
         return [_text(
-            f"⭐ *Rate {name}*\n\n"
-            "1️⃣ Poor\n"
-            "2️⃣ Below average\n"
-            "3️⃣ Average\n"
-            "4️⃣ Good\n"
-            "5️⃣ Excellent\n\n"
+            "🤔 I understand you're not feeling well.\n\n"
+            "Could you tell me the *medicine name* you're looking for?\n"
+            "Or try describing your symptoms differently.\n\n"
+            "_e.g. paracetamol, ibuprofen, flu medicine_\n"
             "_Reply *0* for main menu_"
         )]
 
-    async def _handle_rating(self, customer_id: str, score: int, history: Optional[List[dict]], comment: str = None) -> List[dict]:
-        """Handle rating with optional inline comment, or prompt for comment."""
-        pharmacy_id = await self._get_last_viewed_pharmacy(customer_id)
+    async def _handle_rate_command(self, customer_id: str, text: str, session: dict) -> List[dict]:
+        """Handle 'rate 4' or 'rate 5 great service'."""
+        pharmacy_id = session.get("viewing_pharmacy")
         if not pharmacy_id:
-            return [_text(
-                "Please view a pharmacy first, then reply *rate*.\n\n"
-                "_Reply *0* for main menu_"
-            )]
+            return [_text("Please view a pharmacy first, then type *rate 1-5*.\n\n_Reply *0* for main menu_")]
+
+        parts = text.split(None, 2)
+        try:
+            score = int(parts[1])
+            if not (1 <= score <= 5):
+                raise ValueError
+        except (IndexError, ValueError):
+            return await self._show_rating_prompt(customer_id, session)
+
+        comment = parts[2] if len(parts) > 2 else None
 
         if comment:
             return await self._finalize_rating(customer_id, score, comment, pharmacy_id)
 
-        # Save state: awaiting comment
-        await db.save_conversation_message({
-            "customer_id": customer_id,
-            "role": "system",
-            "content": json.dumps({"awaiting_comment": {"score": score, "pharmacy_id": pharmacy_id}}),
-        })
-
-        return [_text(
-            f"{_stars(score)} Thanks!\n\n"
-            "Leave a comment? Type it now or reply *skip*"
-        )]
+        # Prompt for optional comment
+        await _save_session(customer_id, {"awaiting_comment": {"score": score, "pharmacy_id": pharmacy_id}})
+        return [_text(f"{_stars(score)} Got it!\n\nWant to leave a comment? Type it now, or reply *skip*.")]
 
     async def _finalize_rating(self, customer_id: str, score: int, comment: Optional[str], pharmacy_id: str) -> List[dict]:
-        """Save rating and return confirmation."""
         await db.create_or_update_rating({
             "customer_id": customer_id,
             "pharmacy_id": pharmacy_id,
             "score": score,
             "comment": comment,
         })
+        pharmacy = await db.get_pharmacy_details(pharmacy_id)
+        name = pharmacy.get("name", "the pharmacy") if pharmacy else "the pharmacy"
+        msg = f"✅ You rated *{name}* {_stars(score)}"
+        if comment:
+            msg += f"\n_{comment}_"
+        msg += "\n\nThank you! 🙏\n\n_Type a medicine name to search, or *0* for menu_"
+        return [_text(msg)]
+
+    async def _show_rating_prompt(self, customer_id: str, session: dict) -> List[dict]:
+        pharmacy_id = session.get("viewing_pharmacy")
+        if not pharmacy_id:
+            return [_text("Please view a pharmacy first, then type *rate*.\n\n_Reply *0* for main menu_")]
+        pharmacy = await db.get_pharmacy_details(pharmacy_id)
+        name = pharmacy.get("name", "this pharmacy") if pharmacy else "this pharmacy"
         return [_text(
-            "✅ Rating saved! Thank you for helping others. 🙏\n\n"
+            f"⭐ *Rate {name}*\n\n"
+            "Reply with *rate 1* to *rate 5*:\n"
+            "  1 = Poor · 2 = Fair · 3 = OK · 4 = Good · 5 = Excellent\n\n"
+            "_e.g. rate 5 great service!_\n"
             "_Reply *0* for main menu_"
         )]
 
-    async def _handle_save_pharmacy(self, customer_id: str) -> List[dict]:
-        """Save the currently viewed pharmacy."""
-        pharmacy_id = await self._get_last_viewed_pharmacy(customer_id)
+    async def _save_current_pharmacy(self, customer_id: str, session: dict) -> List[dict]:
+        pharmacy_id = session.get("viewing_pharmacy")
         if not pharmacy_id:
-            return [_text(
-                "Please view a pharmacy first, then reply *save*.\n\n"
-                "_Reply *0* for main menu_"
-            )]
+            return [_text("Please view a pharmacy first, then type *save*.\n\n_Reply *0* for main menu_")]
         try:
             await db.save_pharmacy_for_customer(customer_id, pharmacy_id)
-            pharmacy = await db.get_pharmacy_by_id(pharmacy_id)
+            pharmacy = await db.get_pharmacy_details(pharmacy_id)
             name = pharmacy.get("name", "Pharmacy") if pharmacy else "Pharmacy"
-            return [_text(
-                f"💾 *{name}* saved!\n\n"
-                "Reply *saved* to view all your saved pharmacies.\n"
-                "_Reply *0* for main menu_"
-            )]
+            return [_text(f"💾 *{name}* saved!\n\nType *saved* to see all your bookmarks.\n_Reply *0* for main menu_")]
         except Exception as e:
             logger.error(f"Save pharmacy error: {e}")
-            return [_text("⚠️ Couldn't save that pharmacy. Please try again.\n\n_Reply *0* for main menu_")]
+            return [_text("⚠️ Couldn't save. Please try again.\n\n_Reply *0* for main menu_")]
 
-    async def _handle_saved_pharmacies(self, customer_id: str) -> List[dict]:
-        """Show the customer's saved pharmacies."""
+    async def _show_saved_pharmacies(self, customer_id: str) -> List[dict]:
         try:
             saved = await db.get_saved_pharmacies(customer_id)
         except Exception as e:
-            logger.error(f"Saved pharmacies error: {e}")
+            logger.error(f"Saved pharmacies fetch error: {e}")
             saved = []
 
         if not saved:
             return [_text(
                 "💾 *My Saved Pharmacies*\n\n"
-                "You haven't saved any pharmacies yet. Search for one to get started.\n\n"
-                "_Reply *1* to find a medicine or *0* for main menu_"
+                "You haven't saved any yet.\n"
+                "View a pharmacy and type *save* to bookmark it.\n\n"
+                "_Reply *0* for main menu_"
             )]
 
         lines = ["💾 *My Saved Pharmacies*\n"]
@@ -677,43 +650,33 @@ class WhatsAppService:
             if not p.get("id"):
                 continue
             pharmacy_ids.append(p["id"])
-            lines.append(_fmt_pharmacy_line(idx, p))
+            hours_data = _parse_opening_hours(p.get("opening_hours"))
+            status = _open_status_badge(hours_data)
+            line = f"{idx}. {status} *{p.get('name', '?')}*" if status else f"{idx}. *{p.get('name', '?')}*"
+            suburb = p.get("suburb") or p.get("city") or ""
+            if suburb:
+                line += f"\n   📍 {suburb}"
+            lines.append(line)
             lines.append("")
 
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("_Reply with a number for full details_")
+        lines.append("_Reply with a number for details_")
         lines.append("_Reply *0* for main menu_")
 
-        # Save IDs for numeric selection
-        await db.save_conversation_message({
-            "customer_id": customer_id,
-            "role": "system",
-            "content": json.dumps({"search_results": pharmacy_ids, "type": "saved"}),
-        })
-
+        await _save_session(customer_id, {"search_results": pharmacy_ids})
         return [_text("\n".join(lines))]
 
-    async def _handle_selection(self, customer_id: str, idx: int, history: Optional[List[dict]]) -> List[dict]:
-        """Handle numeric selection from results list → STATE 4 pharmacy detail."""
-        last_results = await self._get_last_search_results(customer_id)
-        if not last_results or idx < 1 or idx > len(last_results):
-            return [_text(f"Please reply with a number between 1 and {len(last_results) if last_results else '?'}.\n\n_Reply *0* for main menu_")]
-
-        pharmacy_id = last_results[idx - 1]
+    async def _show_pharmacy_detail(self, customer_id: str, pharmacy_id: str) -> List[dict]:
+        """Show full pharmacy detail — location pin + info card."""
         pharmacy = await db.get_pharmacy_details(pharmacy_id)
         if not pharmacy:
             return [_text("Sorry, that pharmacy is no longer available.\n\n_Reply *0* for main menu_")]
 
-        # Save that the customer is viewing this pharmacy
-        await db.save_conversation_message({
-            "customer_id": customer_id,
-            "role": "system",
-            "content": json.dumps({"viewing_pharmacy": pharmacy_id}),
-        })
+        await _save_session(customer_id, {"viewing_pharmacy": pharmacy_id})
 
         actions = []
 
-        # Message 1: Location pin (if coords available)
+        # Location pin
         lat = pharmacy.get("latitude")
         lng = pharmacy.get("longitude")
         name = pharmacy.get("name", "Pharmacy")
@@ -721,15 +684,92 @@ class WhatsAppService:
             addr = ", ".join(filter(None, [pharmacy.get("address", ""), pharmacy.get("suburb", ""), pharmacy.get("city", "")]))
             actions.append(_location(float(lat), float(lng), name, addr))
 
-        # Message 2: Info card
+        # Info card
         actions.append(_text(_fmt_pharmacy_detail(pharmacy)))
-
         return actions
 
-    async def _handle_pharmacy_search(self, customer_id: str, query: str) -> List[dict]:
+    # ═══════════════════════════════════════════════════════════════════════
+    # Search & format
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _search_medicines(self, customer_id: str, names: List[str], query: str) -> List[dict]:
+        """Search medicines by name, format as a single numbered list grouped by pharmacy."""
+        results = await search_service.find_medicines(names)
+        await analytics_service.log_search(customer_id, query, results)
+
+        if not results or all(not r.get("pharmacies") for r in results):
+            # Auto-add for admin review
+            for name in names:
+                await db.add_unverified_medicine(name.strip(), added_by=customer_id)
+            names_str = ", ".join(f"*{n}*" for n in names)
+            return [_text(
+                f"😔 No pharmacies found with {names_str} in stock.\n\n"
+                "• Try a different spelling or generic name\n"
+                "• Describe your symptoms instead\n"
+                "• Send a prescription photo 📸\n\n"
+                "_Reply *0* for main menu_"
+            )]
+
+        # Build a flat list: group inventory by pharmacy across all medicines
+        # pharmacy_id → {pharmacy_data, medicines: [{name, price, in_stock, qty}]}
+        pharmacy_map = {}
+        for med in results:
+            med_name = med.get("name", "Unknown")
+            for inv in med.get("pharmacies", []):
+                p = inv.get("pharmacies") or {}
+                p_id = p.get("id") or inv.get("pharmacy_id")
+                if not p_id:
+                    continue
+                if p_id not in pharmacy_map:
+                    pharmacy_map[p_id] = {"pharmacy": p, "medicines": [], "best_price": 9999, "is_open": None}
+                pharmacy_map[p_id]["medicines"].append({
+                    "name": med_name,
+                    "price": inv.get("price"),
+                    "in_stock": inv.get("in_stock", True),
+                    "quantity_available": inv.get("quantity_available"),
+                })
+                try:
+                    price = float(inv.get("price", 9999))
+                except (ValueError, TypeError):
+                    price = 9999
+                if price < pharmacy_map[p_id]["best_price"]:
+                    pharmacy_map[p_id]["best_price"] = price
+
+                # Compute open status once
+                if pharmacy_map[p_id]["is_open"] is None:
+                    hours_data = _parse_opening_hours(p.get("opening_hours"))
+                    pharmacy_map[p_id]["is_open"] = _is_pharmacy_open(hours_data)
+
+        # Sort: open first, then by best price
+        sorted_entries = sorted(
+            pharmacy_map.values(),
+            key=lambda e: (0 if e["is_open"] is True else (2 if e["is_open"] is False else 1), e["best_price"]),
+        )
+
+        # Format
+        lines = []
+        searched_names = ", ".join(f"*{n}*" for n in names)
+        lines.append(f"💊 Results for {searched_names}:\n")
+
+        pharmacy_ids = []
+        for idx, entry in enumerate(sorted_entries[:8], 1):
+            p = entry["pharmacy"]
+            pharmacy_ids.append(p.get("id") or "")
+            lines.append(_fmt_pharmacy_line(idx, p, medicines_info=entry["medicines"]))
+            lines.append("")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("_Reply with a *number* for full details_")
+        lines.append("_Type another medicine name to search_")
+        lines.append("_Reply *0* for main menu_")
+
+        await _save_session(customer_id, {"search_results": pharmacy_ids})
+        return [_text("\n".join(lines))]
+
+    async def _search_pharmacies(self, customer_id: str, query: str) -> List[dict]:
         """Search pharmacies by name or area."""
         if not query:
-            return [_text(self.LOCATION_PROMPT)]
+            return [_text(self.NEAR_ME_PROMPT)]
 
         results = await db.search_pharmacies_by_name(query)
         if not results:
@@ -737,159 +777,37 @@ class WhatsAppService:
 
         if not results:
             return [_text(
-                f"😔 No pharmacies found matching *{query}*.\n"
-                "• Try a shorter name or generic alternative\n"
-                "• Share your 📍 location for a wider search\n"
-                "• Type a different area name\n\n"
+                f"😔 No pharmacies found for *{query}*.\n\n"
+                "Try a different area name or spelling.\n\n"
                 "_Reply *0* for main menu_"
             )]
 
-        lines = [f"🏥 Pharmacies matching *{query}*:\n"]
+        return await self._format_pharmacy_results(customer_id, results[:5], query)
+
+    async def _format_pharmacy_results(self, customer_id: str, results: list, label: str) -> List[dict]:
+        """Format a pharmacy list and save IDs for selection."""
+        lines = [f"🏥 Pharmacies near *{label}*:\n"]
         pharmacy_ids = []
-        for idx, p in enumerate(results[:5], 1):
+        for idx, p in enumerate(results, 1):
             pharmacy_ids.append(p["id"])
-            lines.append(_fmt_pharmacy_line(idx, p))
+            hours_data = _parse_opening_hours(p.get("opening_hours"))
+            status = _open_status_badge(hours_data)
+            header = f"{idx}. {status} *{p.get('name', '?')}*" if status else f"{idx}. *{p.get('name', '?')}*"
+            lines.append(header)
+            loc = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", "")]))
+            if loc:
+                lines.append(f"   📍 {loc}")
+            phone = p.get("phone") or p.get("whatsapp_number")
+            if phone:
+                lines.append(f"   📞 {phone}")
             lines.append("")
 
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("_Reply with a number for full details_")
-        lines.append("_Type a new medicine name to search again_")
+        lines.append("_Reply with a *number* for full details_")
         lines.append("_Reply *0* for main menu_")
 
-        # Save result IDs for selection
-        await db.save_conversation_message({
-            "customer_id": customer_id,
-            "role": "system",
-            "content": json.dumps({"search_results": pharmacy_ids, "type": "pharmacy"}),
-        })
-
+        await _save_session(customer_id, {"search_results": pharmacy_ids})
         return [_text("\n".join(lines))]
-
-    async def _handle_ai_intent(self, customer_id: str, text: str, history: Optional[List[dict]]) -> List[dict]:
-        """Use AI to understand intent and route accordingly."""
-        try:
-            intent = stepfun_service.understand_intent(text, history=history)
-        except Exception as e:
-            logger.error(f"AI intent error: {e}")
-            # Fallback: treat raw input as medicine search
-            return await self._search_and_format_medicines(customer_id, [text], text)
-
-        intent_type = intent.get("intent", "unknown")
-        medicines = intent.get("medicines", [])
-
-        logger.info(f"[INTENT] user_id={customer_id} raw=\"{text}\" intent={intent_type} medicines={medicines}")
-
-        if intent_type == "greeting":
-            return [_text(self.WELCOME)]
-
-        if intent_type == "search_medicine" and medicines:
-            return await self._search_and_format_medicines(customer_id, medicines, text)
-
-        if intent_type == "search_pharmacy":
-            area = intent.get("area", text)
-            return await self._handle_pharmacy_search(customer_id, area)
-
-        if intent_type == "select_result":
-            idx = intent.get("selection_index")
-            if idx:
-                return await self._handle_selection(customer_id, idx, history)
-
-        if intent_type == "request_alternatives" and medicines:
-            return await self._search_and_format_medicines(customer_id, medicines, text)
-
-        # Default: try medicine search with whatever we have
-        if medicines:
-            return await self._search_and_format_medicines(customer_id, medicines, text)
-
-        # Last resort: treat raw text as medicine search
-        return await self._search_and_format_medicines(customer_id, [text], text)
-
-    # ── Internal helpers ────────────────────────────────────────────────────
-
-    async def _search_and_format_medicines(
-        self, customer_id: str, medicines: List[str], query: str
-    ) -> List[dict]:
-        """Search medicines, log analytics, format results. Auto-add unverified if not found."""
-        results = await search_service.find_medicines(medicines)
-        await analytics_service.log_search(customer_id, query, results)
-
-        if not results:
-            # Add unverified medicines for admin review
-            for med_name in medicines:
-                await db.add_unverified_medicine(med_name.strip(), added_by=customer_id)
-
-            names = ", ".join(f"*{m}*" for m in medicines)
-            return [_text(
-                f"� No pharmacies found with {names} nearby.\n"
-                "• Try a shorter name or generic alternative\n"
-                "• Share your 📍 location for a wider search\n"
-                "• Type a different medicine name\n\n"
-                "_Reply *0* for main menu_"
-            )]
-
-        # Collect pharmacy IDs for selection
-        all_pharmacy_ids = []
-        response_parts = []
-
-        for med in results:
-            pharmacies = med.get("pharmacies", [])
-            med_name = med.get("name", "Unknown")
-
-            for inv in pharmacies[:5]:
-                p = inv.get("pharmacies") or {}
-                p_id = p.get("id") or inv.get("pharmacy_id")
-                if p_id and p_id not in all_pharmacy_ids:
-                    all_pharmacy_ids.append(p_id)
-
-            response_parts.append(_fmt_medicine_results(med_name, pharmacies))
-
-        # Save result IDs for numeric selection
-        await db.save_conversation_message({
-            "customer_id": customer_id,
-            "role": "system",
-            "content": json.dumps({"search_results": all_pharmacy_ids, "type": "medicine"}),
-        })
-
-        return [_text("\n\n".join(response_parts))]
-
-    async def _get_last_search_results(self, customer_id: str) -> Optional[List[str]]:
-        """Get pharmacy IDs from the last search results in conversation."""
-        history = await db.get_conversation_history(customer_id, limit=20)
-        for msg in reversed(history):
-            if msg.get("role") == "system":
-                try:
-                    data = json.loads(msg.get("content", "{}"))
-                    if "search_results" in data:
-                        return data["search_results"]
-                except (json.JSONDecodeError, TypeError):
-                    continue
-        return None
-
-    async def _get_last_viewed_pharmacy(self, customer_id: str, history: Optional[List[dict]] = None) -> Optional[str]:
-        """Get the last pharmacy ID the customer viewed."""
-        rows = await db.get_conversation_history(customer_id, limit=20)
-        for msg in reversed(rows):
-            if msg.get("role") == "system":
-                try:
-                    data = json.loads(msg.get("content", "{}"))
-                    if "viewing_pharmacy" in data:
-                        return data["viewing_pharmacy"]
-                except (json.JSONDecodeError, TypeError):
-                    continue
-        return None
-
-    async def _get_session_state(self, customer_id: str) -> Optional[dict]:
-        """Get the latest session state from conversation (e.g. awaiting_comment)."""
-        rows = await db.get_conversation_history(customer_id, limit=5)
-        for msg in reversed(rows):
-            if msg.get("role") == "system":
-                try:
-                    data = json.loads(msg.get("content", "{}"))
-                    if "awaiting_comment" in data:
-                        return data
-                except (json.JSONDecodeError, TypeError):
-                    continue
-        return None
 
 
 whatsapp_service = WhatsAppService()

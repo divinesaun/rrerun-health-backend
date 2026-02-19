@@ -8,39 +8,13 @@ from app import database as db
 
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
 
-# Map template names → twilio_service getter methods
-_TEMPLATE_MAP = {
-    "welcome": "get_welcome_template",
-    "menu": "get_menu_template",
-    "help": "get_help_template",
-    "results_nav": "get_results_nav_template",
-    "pharmacy_actions": "get_pharmacy_actions_template",
-    "rating": "get_rating_template",
-    "post_rating": "get_post_rating_template",
-}
-
 
 async def _send_action(to: str, action: dict) -> None:
-    """Dispatch a single message action to the appropriate Twilio method."""
+    """Dispatch a single message action via Twilio. Only text and location supported."""
     action_type = action.get("type", "text")
 
     if action_type == "text":
         await twilio_service.send_message(to, action["body"])
-
-    elif action_type == "interactive":
-        template_name = action.get("template", "menu")
-        getter = _TEMPLATE_MAP.get(template_name)
-        if getter:
-            try:
-                content_sid = getattr(twilio_service, getter)()
-                await twilio_service.send_interactive(to, content_sid)
-            except Exception as e:
-                logger.warning(f"Interactive template '{template_name}' failed, falling back to text: {e}")
-                # Fallback: send the template body as plain text
-                await twilio_service.send_message(to, f"_Reply *menu* for options_")
-        else:
-            logger.warning(f"Unknown template '{template_name}', sending menu fallback")
-            await twilio_service.send_message(to, "_Reply *menu* for options_")
 
     elif action_type == "location":
         try:
@@ -49,21 +23,12 @@ async def _send_action(to: str, action: dict) -> None:
             )
         except Exception as e:
             logger.warning(f"Location send failed, falling back to text: {e}")
-            await twilio_service.send_message(to, f"📍 {action['label']}\n{action.get('address', '')}")
+            lat, lng = action.get("lat", ""), action.get("lng", "")
+            maps_url = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else ""
+            await twilio_service.send_message(to, f"📍 {action['label']}\n{action.get('address', '')}\n{maps_url}")
 
-    elif action_type == "cta":
-        try:
-            await twilio_service.send_cta(to, action["body"], action["actions"])
-        except Exception as e:
-            logger.warning(f"CTA send failed, falling back to text: {e}")
-            # Fallback: show buttons as text links
-            lines = [action["body"]]
-            for a in action.get("actions", []):
-                if a["type"] == "PHONE_NUMBER":
-                    lines.append(f"📞 {a.get('phone', '')}")
-                elif a["type"] == "URL":
-                    lines.append(f"🗺️ {a.get('url', '')}")
-            await twilio_service.send_message(to, "\n".join(lines))
+    else:
+        logger.warning(f"Unknown action type '{action_type}', skipping")
 
 
 @router.post("/whatsapp")

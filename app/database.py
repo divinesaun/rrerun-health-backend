@@ -254,7 +254,7 @@ async def search_medicines_with_inventory(medicine_names: List[str]) -> List[Dic
         for med in medicines.data:
             inventory = (
                 supabase.table("inventory")
-                .select("*, pharmacies(id, name, address, suburb, phone, whatsapp_number, opening_hours)")
+                .select("*, pharmacies(id, name, address, suburb, city, phone, whatsapp_number, opening_hours, rating, total_reviews, has_delivery, accepts_medical_aid, is_24_hours, latitude, longitude, parking_available, website, facebook, instagram, special_services)")
                 .eq("medicine_id", med["id"])
                 .eq("in_stock", True)
                 .order("price")
