@@ -105,11 +105,14 @@ class TestCSVUpload:
 
     @patch("app.utils.security.db")
     @patch("app.routers.pharmacy.db")
-    async def test_csv_missing_medicine(self, mock_router_db, mock_sec_db, client, sample_pharmacy_user):
+    async def test_csv_unknown_medicine_auto_created(self, mock_router_db, mock_sec_db, client, sample_pharmacy_user):
+        """Unknown medicines should be auto-created during bulk upload."""
         mock_sec_db.get_pharmacy_user_by_id = AsyncMock(return_value=sample_pharmacy_user)
         mock_router_db.find_medicine_by_name = AsyncMock(return_value=None)
+        mock_router_db.create_medicine = AsyncMock(return_value={"id": "new-med-id", "name": "FakeMedicine"})
+        mock_router_db.upsert_inventory = AsyncMock(return_value={"id": "inv-1"})
 
-        csv_content = "medicine_name,price,in_stock\nFakeMedicine,5.00,true\n"
+        csv_content = "medicine_name,price\nFakeMedicine,5.00\n"
         token = make_pharmacy_token()
         response = await client.post(
             "/api/pharmacy/inventory/bulk-upload",
@@ -117,7 +120,9 @@ class TestCSVUpload:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
-        assert "Not found: FakeMedicine" in response.json()["errors"]
+        data = response.json()
+        assert "FakeMedicine" in data["created"]
+        assert "FakeMedicine" in data["success"]
 
     @patch("app.utils.security.db")
     async def test_csv_missing_columns(self, mock_sec_db, client, sample_pharmacy_user):

@@ -84,10 +84,28 @@ async def add_inventory(
     payload: InventoryCreate,
     current_user: dict = Depends(get_current_user),
 ):
-    """Add a new medicine to inventory."""
+    """Add a medicine to inventory. Accepts medicine_id OR free-text medicine_name."""
+    medicine_id = payload.medicine_id
+
+    # If no medicine_id provided, find or create by name
+    if not medicine_id:
+        if not payload.medicine_name or not payload.medicine_name.strip():
+            raise HTTPException(status_code=400, detail="Either medicine_id or medicine_name is required")
+        name = payload.medicine_name.strip()
+        existing = await db.find_medicine_by_name(name)
+        if existing:
+            medicine_id = existing["id"]
+        else:
+            med_data = {"name": name}
+            if payload.category:
+                med_data["category"] = payload.category
+            created = await db.create_medicine(med_data)
+            medicine_id = created["id"]
+            logger.info(f"[INVENTORY] Auto-created medicine '{name}' (id={medicine_id})")
+
     item = await db.add_inventory_item({
         "pharmacy_id": current_user["pharmacy_id"],
-        "medicine_id": payload.medicine_id,
+        "medicine_id": medicine_id,
         "price": payload.price,
         "in_stock": payload.in_stock,
         "quantity_available": payload.quantity_available,
@@ -133,29 +151,41 @@ async def bulk_upload_inventory(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV file: {e}")
 
-    required_cols = {"medicine_name", "price", "in_stock"}
+    required_cols = {"medicine_name", "price"}
     if not required_cols.issubset(set(df.columns)):
         raise HTTPException(
             status_code=400,
             detail=f"CSV must contain columns: {required_cols}. Found: {list(df.columns)}",
         )
 
-    results = {"success": [], "errors": []}
+    results = {"created": [], "updated": [], "errors": []}
     for _, row in df.iterrows():
-        medicine = await db.find_medicine_by_name(row["medicine_name"])
-        if not medicine:
-            results["errors"].append(f"Not found: {row['medicine_name']}")
-            continue
-        await db.upsert_inventory({
-            "pharmacy_id": current_user["pharmacy_id"],
-            "medicine_id": medicine["id"],
-            "price": float(row["price"]),
-            "in_stock": bool(row["in_stock"]),
-            "quantity_available": str(row.get("quantity_available", "In Stock")),
-        })
-        results["success"].append(medicine["name"])
+        try:
+            name = str(row["medicine_name"]).strip()
+            if not name:
+                continue
+            medicine = await db.find_medicine_by_name(name)
+            if not medicine:
+                med_data = {"name": name}
+                if "category" in df.columns and pd.notna(row.get("category")):
+                    med_data["category"] = str(row["category"]).strip()
+                medicine = await db.create_medicine(med_data)
+                results["created"].append(name)
+                logger.info(f"[BULK] Auto-created medicine '{name}'")
+            in_stock = bool(row["in_stock"]) if "in_stock" in df.columns and pd.notna(row.get("in_stock")) else True
+            qty = str(row.get("quantity_available", "In Stock")) if "quantity_available" in df.columns else "In Stock"
+            await db.upsert_inventory({
+                "pharmacy_id": current_user["pharmacy_id"],
+                "medicine_id": medicine["id"],
+                "price": float(row["price"]),
+                "in_stock": in_stock,
+                "quantity_available": qty,
+            })
+            results["updated"].append(name)
+        except Exception as e:
+            results["errors"].append(f"{row.get('medicine_name', '?')}: {e}")
 
-    return results
+    return {"success": results["updated"], "created": results["created"], "errors": results["errors"]}
 
 
 class FixCsvRequest(BaseModel):
@@ -241,6 +271,21 @@ async def update_pharmacy_profile(
                 update_data["opening_hours"] = _json.loads(oh)
             except (_json.JSONDecodeError, TypeError):
                 pass  # keep as-is if not valid JSON
-        # If it's already a dict, it's ready for JSONB storage
-    pharmacy = await db.update_pharmacy(current_user["pharmacy_id"], update_data)
-    return {"pharmacy": pharmacy}
+    # latitude / longitude are numeric in DB — cast strings to float
+    for coord_key in ("latitude", "longitude"):
+        if coord_key in update_data and update_data[coord_key] is not None:
+            try:
+                update_data[coord_key] = float(update_data[coord_key])
+            except (ValueError, TypeError):
+                update_data.pop(coord_key)
+    # Strip empty strings → null for nullable text columns
+    for key in ("phone", "suburb", "city", "email", "whatsapp_number", "chain_name",
+                "special_services", "website", "facebook", "instagram"):
+        if key in update_data and update_data[key] == "":
+            update_data[key] = None
+    try:
+        pharmacy = await db.update_pharmacy(current_user["pharmacy_id"], update_data)
+        return {"pharmacy": pharmacy}
+    except Exception as e:
+        logger.error(f"Profile update failed for pharmacy {current_user['pharmacy_id']}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update profile: {str(e)}")

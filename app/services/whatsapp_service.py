@@ -20,6 +20,7 @@ Routing priority (strict order):
 """
 
 import json
+import math
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -68,6 +69,14 @@ def _location(lat: float, lng: float, label: str, address: str = "") -> dict:
 
 def _stars(score: int) -> str:
     return "⭐" * score
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in km between two lat/lon points."""
+    R = 6371
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = math.sin(d_lat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -230,7 +239,7 @@ def _fmt_pharmacy_detail(p: dict) -> str:
         lines.append(status)
     lines.append("")
 
-    # Address (Maps link removed — location pin is sent as a separate message)
+    # Address
     loc = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", ""), p.get("city", "")]))
     if loc:
         lines.append(f"📍 {loc}")
@@ -277,6 +286,12 @@ def _fmt_pharmacy_detail(p: dict) -> str:
         full = int(float(rating))
         rating_fmt = f"{float(rating):.1f}"
         lines.append(f"{'⭐' * full} {rating_fmt}/5.0 ({reviews} review{'s' if reviews != 1 else ''})")
+        lines.append("")
+
+    # Google Maps link (after reviews)
+    lat, lng = p.get("latitude"), p.get("longitude")
+    if lat and lng:
+        lines.append(f"🗺️ https://maps.google.com/?q={lat},{lng}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -503,7 +518,18 @@ class WhatsAppService:
             logger.info(f"[ROUTE] customer={customer_id} path=PHARMACY_SEARCH query={query!r}")
             return await self._search_pharmacies(customer_id, query)
 
-        # ── 12. Symptom detection → LLM → medicine search ──
+        # ── 12. Medication reminders ──
+        if lower.startswith("remind ") or lower.startswith("reminder "):
+            logger.info(f"[ROUTE] customer={customer_id} path=REMINDER_SET input={text[:80]!r}")
+            return await self._handle_set_reminder(customer_id, text)
+        if lower in ("reminders", "my reminders", "list reminders"):
+            logger.info(f"[ROUTE] customer={customer_id} path=REMINDER_LIST")
+            return await self._handle_list_reminders(customer_id)
+        if lower.startswith("cancel reminder") or lower == "cancel all reminders":
+            logger.info(f"[ROUTE] customer={customer_id} path=REMINDER_CANCEL input={text[:80]!r}")
+            return await self._handle_cancel_reminder(customer_id, text)
+
+        # ── 13. Symptom detection → LLM → medicine search ──
         if _is_symptom_text(text):
             logger.info(f"[ROUTE] customer={customer_id} path=SYMPTOM_LLM text={text[:80]!r}")
             return await self._handle_symptoms(customer_id, text)
@@ -560,7 +586,7 @@ class WhatsAppService:
             )]
 
     async def _handle_location(self, customer_id: str, coords: Tuple[float, float]) -> List[dict]:
-        """User shared a location — search pharmacies nearby."""
+        """User shared a location — search open pharmacies sorted by distance."""
         lat, lng = coords
         logger.info(f"[LOCATION] customer={customer_id} lat={lat} lng={lng}")
 
@@ -570,7 +596,7 @@ class WhatsAppService:
         except Exception as e:
             logger.warning(f"Failed to save customer location: {e}")
 
-        # Search pharmacies near the area
+        # Get ALL active pharmacies, compute distance, filter open, sort
         results = await db.search_pharmacies_by_area("")
         if not results:
             return [_text(
@@ -579,7 +605,162 @@ class WhatsAppService:
                 "_Reply *0* for main menu_"
             )]
 
-        return await self._format_pharmacy_results(customer_id, results[:5], "your location 📍")
+        # Compute distance and open status for each pharmacy
+        enriched = []
+        for p in results:
+            p_lat = p.get("latitude")
+            p_lng = p.get("longitude")
+            if p_lat and p_lng:
+                try:
+                    p["distance_km"] = round(_haversine(lat, lng, float(p_lat), float(p_lng)), 2)
+                except (ValueError, TypeError):
+                    p["distance_km"] = None
+            else:
+                p["distance_km"] = None
+            hours_data = _parse_opening_hours(p.get("opening_hours"))
+            p["_is_open"] = _is_pharmacy_open(hours_data)
+            enriched.append(p)
+
+        # Sort: open first, then by distance
+        enriched.sort(key=lambda p: (
+            0 if p["_is_open"] is True else (2 if p["_is_open"] is False else 1),
+            p.get("distance_km") if p.get("distance_km") is not None else 9999,
+        ))
+
+        return await self._format_pharmacy_results(
+            customer_id, enriched[:8], "your location 📍", user_coords=coords
+        )
+
+    # ── Medication reminder handlers ─────────────────────────────────────
+
+    _REMIND_RE = re.compile(
+        r"^remind(?:er)?\s+(.+?)\s+(?:at\s+)?(\d{1,2}[:\.]?\d{0,2})\s*(am|pm)?",
+        re.IGNORECASE,
+    )
+
+    async def _handle_set_reminder(self, customer_id: str, text: str) -> List[dict]:
+        """Parse 'remind Paracetamol 08:00' or 'remind Metformin 2pm' and create a reminder."""
+        m = self._REMIND_RE.match(text)
+        if not m:
+            return [_text(
+                "⏰ *Set a medication reminder*\n\n"
+                "Format: *remind [medicine] [time]*\n"
+                "Examples:\n"
+                "  _remind Paracetamol 08:00_\n"
+                "  _remind Metformin 2pm_\n"
+                "  _remind Blood pressure pill 9:30am_\n\n"
+                "_Reply *reminders* to see your list_\n"
+                "_Reply *0* for main menu_"
+            )]
+
+        medicine_name = m.group(1).strip()
+        raw_time = m.group(2).replace(".", ":")
+        ampm = (m.group(3) or "").lower()
+
+        # Parse time
+        try:
+            if ":" in raw_time:
+                parts = raw_time.split(":")
+                hour, minute = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+            else:
+                hour, minute = int(raw_time), 0
+            if ampm == "pm" and hour < 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("Invalid time")
+            time_str = f"{hour:02d}:{minute:02d}:00"
+        except (ValueError, IndexError):
+            return [_text("⚠️ Invalid time format. Try: *remind Paracetamol 08:00* or *remind Metformin 2pm*")]
+
+        try:
+            await db.create_reminder({
+                "customer_id": customer_id,
+                "medicine_name": medicine_name,
+                "reminder_time": time_str,
+            })
+            display_time = f"{hour:02d}:{minute:02d}"
+            return [_text(
+                f"✅ Reminder set!\n\n"
+                f"💊 *{medicine_name}*\n"
+                f"⏰ Every day at *{display_time}*\n\n"
+                "_Reply *reminders* to see all your reminders_\n"
+                "_Reply *0* for main menu_"
+            )]
+        except Exception as e:
+            logger.error(f"Failed to create reminder for {customer_id}: {e}")
+            return [_text("⚠️ Sorry, I couldn't save that reminder. Please try again.")]
+
+    async def _handle_list_reminders(self, customer_id: str) -> List[dict]:
+        """Show all active reminders for this customer."""
+        try:
+            reminders = await db.list_reminders(customer_id)
+        except Exception as e:
+            logger.error(f"Failed to list reminders for {customer_id}: {e}")
+            return [_text("⚠️ Sorry, I couldn't load your reminders right now.")]
+
+        if not reminders:
+            return [_text(
+                "⏰ *Your Medication Reminders*\n\n"
+                "You don't have any active reminders.\n\n"
+                "Set one with: *remind [medicine] [time]*\n"
+                "Example: _remind Paracetamol 08:00_\n\n"
+                "_Reply *0* for main menu_"
+            )]
+
+        lines = ["⏰ *Your Medication Reminders*\n"]
+        for idx, r in enumerate(reminders, 1):
+            t = r.get("reminder_time", "?")
+            if isinstance(t, str) and len(t) >= 5:
+                t = t[:5]  # "08:00:00" → "08:00"
+            lines.append(f"{idx}. 💊 *{r.get('medicine_name', '?')}* — {t}")
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("_Cancel one: *cancel reminder [number]*_")
+        lines.append("_Cancel all: *cancel all reminders*_")
+        lines.append("_Reply *0* for main menu_")
+        return [_text("\n".join(lines))]
+
+    async def _handle_cancel_reminder(self, customer_id: str, text: str) -> List[dict]:
+        """Cancel one or all reminders."""
+        lower = text.strip().lower()
+
+        if lower == "cancel all reminders":
+            try:
+                count = await db.cancel_all_reminders(customer_id)
+                if count == 0:
+                    return [_text("You don't have any active reminders to cancel.\n\n_Reply *0* for main menu_")]
+                return [_text(f"✅ Cancelled {count} reminder{'s' if count != 1 else ''}.\n\n_Reply *0* for main menu_")]
+            except Exception as e:
+                logger.error(f"Failed to cancel all reminders for {customer_id}: {e}")
+                return [_text("⚠️ Sorry, couldn't cancel reminders. Please try again.")]
+
+        # "cancel reminder 2" → cancel the 2nd reminder
+        num_match = re.search(r"(\d+)", lower)
+        if not num_match:
+            return [_text(
+                "To cancel a reminder, type:\n"
+                "  *cancel reminder [number]*\n"
+                "  *cancel all reminders*\n\n"
+                "_Reply *reminders* to see your list_"
+            )]
+
+        idx = int(num_match.group(1))
+        try:
+            reminders = await db.list_reminders(customer_id)
+            if not reminders or idx < 1 or idx > len(reminders):
+                return [_text(f"⚠️ No reminder #{idx}. Reply *reminders* to see your list.")]
+            target = reminders[idx - 1]
+            await db.cancel_reminder(target["id"], customer_id)
+            return [_text(
+                f"✅ Cancelled reminder for *{target.get('medicine_name', '?')}*.\n\n"
+                "_Reply *reminders* to see remaining_\n"
+                "_Reply *0* for main menu_"
+            )]
+        except Exception as e:
+            logger.error(f"Failed to cancel reminder for {customer_id}: {e}")
+            return [_text("⚠️ Sorry, couldn't cancel that reminder. Please try again.")]
 
     # Common symptom → OTC suggestion map (shown before searching)
     _SYMPTOM_SUGGESTIONS: dict = {
@@ -757,26 +938,13 @@ class WhatsAppService:
         return [_text("\n".join(lines))]
 
     async def _show_pharmacy_detail(self, customer_id: str, pharmacy_id: str) -> List[dict]:
-        """Show full pharmacy detail — location pin + info card."""
+        """Show full pharmacy detail as a single text message with Maps link."""
         pharmacy = await db.get_pharmacy_details(pharmacy_id)
         if not pharmacy:
             return [_text("Sorry, that pharmacy is no longer available.\n\n_Reply *0* for main menu_")]
 
         await _save_session(customer_id, {"viewing_pharmacy": pharmacy_id})
-
-        actions = []
-
-        # Location pin
-        lat = pharmacy.get("latitude")
-        lng = pharmacy.get("longitude")
-        name = pharmacy.get("name", "Pharmacy")
-        if lat and lng:
-            addr = ", ".join(filter(None, [pharmacy.get("address", ""), pharmacy.get("suburb", ""), pharmacy.get("city", "")]))
-            actions.append(_location(float(lat), float(lng), name, addr))
-
-        # Info card
-        actions.append(_text(_fmt_pharmacy_detail(pharmacy)))
-        return actions
+        return [_text(_fmt_pharmacy_detail(pharmacy))]
 
     # ═══════════════════════════════════════════════════════════════════════
     # Search & format
@@ -874,9 +1042,14 @@ class WhatsAppService:
 
         return await self._format_pharmacy_results(customer_id, results[:5], query)
 
-    async def _format_pharmacy_results(self, customer_id: str, results: list, label: str) -> List[dict]:
-        """Format a pharmacy list with location pins and save IDs for selection."""
-        actions = []
+    async def _format_pharmacy_results(
+        self,
+        customer_id: str,
+        results: list,
+        label: str,
+        user_coords: Optional[Tuple[float, float]] = None,
+    ) -> List[dict]:
+        """Format a pharmacy list as a single text message and save IDs for selection."""
         lines = [f"🏥 Pharmacies near *{label}*:\n"]
         pharmacy_ids = []
         for idx, p in enumerate(results, 1):
@@ -888,25 +1061,28 @@ class WhatsAppService:
             loc = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", "")]))
             if loc:
                 lines.append(f"   📍 {loc}")
+            # Distance line (from user location or pre-computed)
+            dist = p.get("distance_km")
+            if dist is None and user_coords:
+                p_lat, p_lng = p.get("latitude"), p.get("longitude")
+                if p_lat and p_lng:
+                    try:
+                        dist = round(_haversine(user_coords[0], user_coords[1], float(p_lat), float(p_lng)), 2)
+                    except (ValueError, TypeError):
+                        pass
+            if dist is not None:
+                lines.append(f"   📏 {dist:.2f} km away")
             phone = p.get("phone") or p.get("whatsapp_number")
             if phone:
                 lines.append(f"   📞 {phone}")
             lines.append("")
-
-            # Send a location pin for each pharmacy that has coordinates
-            lat, lng = p.get("latitude"), p.get("longitude")
-            if lat and lng:
-                addr = ", ".join(filter(None, [p.get("address", ""), p.get("suburb", ""), p.get("city", "")]))
-                actions.append(_location(float(lat), float(lng), p.get("name", "Pharmacy"), addr))
 
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append("_Reply with a *number* for full details_")
         lines.append("_Reply *0* for main menu_")
 
         await _save_session(customer_id, {"search_results": pharmacy_ids})
-        # Location pins first, then the text list
-        actions.append(_text("\n".join(lines)))
-        return actions
+        return [_text("\n".join(lines))]
 
 
 whatsapp_service = WhatsAppService()

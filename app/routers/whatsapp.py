@@ -40,6 +40,10 @@ async def handle_whatsapp_message(request: Request):
     media_url = form_data.get("MediaUrl0")
     num_media = int(form_data.get("NumMedia", "0"))
 
+    # Twilio sends Latitude/Longitude when user shares a location pin
+    twilio_lat = form_data.get("Latitude")
+    twilio_lng = form_data.get("Longitude")
+
     logger.info(f"WhatsApp from {from_number}: {message_body[:100]}")
 
     try:
@@ -60,14 +64,18 @@ async def handle_whatsapp_message(request: Request):
         if media_url or num_media > 0:
             resolved_media = media_url or form_data.get("MediaUrl0")
 
-        # 4. Save user message
+        # 4. If Twilio sent native location, inject coordinates into message
+        if twilio_lat and twilio_lng:
+            message_body = f"{twilio_lat},{twilio_lng}"
+
+        # 5. Save user message
         await db.save_conversation_message({
             "customer_id": customer_id,
             "role": "user",
             "content": message_body or "[image]",
         })
 
-        # 5. Process via WhatsApp service — returns list of message actions
+        # 6. Process via WhatsApp service — returns list of message actions
         actions = await whatsapp_service.process_message(
             customer_id=customer_id,
             message=message_body,

@@ -325,15 +325,13 @@ class TestRatingComment:
 class TestNumberInput:
 
     async def test_number_with_active_results(self, svc, mock_db):
-        """Path 7a: digit + active results → pharmacy detail."""
+        """Path 7a: digit + active results → pharmacy detail (single text message)."""
         set_session(mock_db, search_results=[PHARM_ID_A, PHARM_ID_B])
         mock_db.get_pharmacy_details.return_value = PHARMACY_A
         result = await svc.process_message(CUST, "1")
-        # Should include location pin + text card
-        types = [a["type"] for a in result]
-        assert "location" in types
-        assert "text" in types
-        assert any("Alpha Pharmacy" in a["body"] for a in result if a["type"] == "text")
+        assert len(result) == 1
+        assert result[0]["type"] == "text"
+        assert "Alpha Pharmacy" in result[0]["body"]
 
     async def test_number_2_with_active_results(self, svc, mock_db):
         """Path 7a2: '2' with results → selects second pharmacy, NOT 'near me'."""
@@ -877,34 +875,31 @@ class TestEdgeCases:
         # session should still have search_results after save
         mock_db.save_pharmacy_for_customer.assert_called_once()
 
-    async def test_pharmacy_detail_no_maps_link(self, svc, mock_db):
-        """Pharmacy detail card should NOT include a Maps link — location pin is sent instead."""
+    async def test_pharmacy_detail_has_maps_link(self, svc, mock_db):
+        """Pharmacy detail card should include a Google Maps link in text."""
         set_session(mock_db, search_results=[PHARM_ID_A])
         mock_db.get_pharmacy_details.return_value = PHARMACY_A
         result = await svc.process_message(CUST, "1")
-        text_bodies = [a["body"] for a in result if a["type"] == "text"]
-        detail = " ".join(text_bodies)
-        assert "maps.google.com" not in detail
-        assert "Main St" in detail  # address still shown as plain text
+        assert len(result) == 1  # single text message, no location pin
+        assert result[0]["type"] == "text"
+        assert "maps.google.com" in result[0]["body"]
+        assert "Main St" in result[0]["body"]
 
-    async def test_pharmacy_detail_has_location_pin(self, svc, mock_db):
-        """Pharmacy with coordinates should send a location pin."""
+    async def test_pharmacy_detail_no_location_pin(self, svc, mock_db):
+        """Pharmacy detail should be a single text message, no location pin."""
         set_session(mock_db, search_results=[PHARM_ID_A])
         mock_db.get_pharmacy_details.return_value = PHARMACY_A
         result = await svc.process_message(CUST, "1")
         location_actions = [a for a in result if a["type"] == "location"]
-        assert len(location_actions) == 1
-        assert location_actions[0]["lat"] == -17.78
-        assert location_actions[0]["lng"] == 31.05
+        assert len(location_actions) == 0
 
-    async def test_pharmacy_without_coords_no_location_pin(self, svc, mock_db):
-        """Pharmacy without coordinates should NOT send a location pin."""
+    async def test_pharmacy_without_coords_no_maps_link(self, svc, mock_db):
+        """Pharmacy without coordinates should NOT include Maps link."""
         no_coords_pharm = {**PHARMACY_A, "latitude": None, "longitude": None}
         set_session(mock_db, search_results=[PHARM_ID_A])
         mock_db.get_pharmacy_details.return_value = no_coords_pharm
         result = await svc.process_message(CUST, "1")
-        location_actions = [a for a in result if a["type"] == "location"]
-        assert len(location_actions) == 0
+        assert "maps.google.com" not in result[0]["body"]
 
     async def test_multiple_medicines_single_numbering(self, svc, mock_db, mock_search, mock_analytics):
         """When search returns multiple medicines, pharmacies should have single sequential numbering."""
@@ -958,3 +953,65 @@ class TestEdgeCases:
         mock_llm.extract_medicines_from_text.assert_called_once()
         bodies = " ".join(a["body"] for a in result if a["type"] == "text")
         assert "Amoxicillin" in bodies
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MEDICATION REMINDERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+class TestMedicationReminders:
+
+    async def test_set_reminder_24h(self, svc, mock_db):
+        """'remind Paracetamol 08:00' should create a reminder."""
+        mock_db.create_reminder = AsyncMock(return_value={"id": "rem-1"})
+        result = await svc.process_message(CUST, "remind Paracetamol 08:00")
+        assert any("Reminder set" in a["body"] for a in result)
+        assert any("Paracetamol" in a["body"] for a in result)
+        mock_db.create_reminder.assert_called_once()
+
+    async def test_set_reminder_ampm(self, svc, mock_db):
+        """'remind Metformin 2pm' should parse as 14:00."""
+        mock_db.create_reminder = AsyncMock(return_value={"id": "rem-2"})
+        result = await svc.process_message(CUST, "remind Metformin 2pm")
+        assert any("14:00" in a["body"] for a in result)
+
+    async def test_set_reminder_bad_format(self, svc, mock_db):
+        """'remind' with no time should show usage instructions."""
+        result = await svc.process_message(CUST, "remind Paracetamol")
+        assert any("Format" in a["body"] or "remind" in a["body"].lower() for a in result)
+
+    async def test_list_reminders_empty(self, svc, mock_db):
+        """'reminders' with no active reminders shows empty message."""
+        mock_db.list_reminders = AsyncMock(return_value=[])
+        result = await svc.process_message(CUST, "reminders")
+        assert any("don't have any" in a["body"] for a in result)
+
+    async def test_list_reminders_with_items(self, svc, mock_db):
+        """'reminders' lists all active reminders."""
+        mock_db.list_reminders = AsyncMock(return_value=[
+            {"id": "rem-1", "medicine_name": "Paracetamol", "reminder_time": "08:00:00"},
+            {"id": "rem-2", "medicine_name": "Metformin", "reminder_time": "14:00:00"},
+        ])
+        result = await svc.process_message(CUST, "reminders")
+        body = result[0]["body"]
+        assert "Paracetamol" in body
+        assert "Metformin" in body
+        assert "08:00" in body
+        assert "14:00" in body
+
+    async def test_cancel_reminder_by_number(self, svc, mock_db):
+        """'cancel reminder 1' cancels the first reminder."""
+        mock_db.list_reminders = AsyncMock(return_value=[
+            {"id": "rem-1", "medicine_name": "Paracetamol", "reminder_time": "08:00:00"},
+        ])
+        mock_db.cancel_reminder = AsyncMock(return_value=True)
+        result = await svc.process_message(CUST, "cancel reminder 1")
+        assert any("Cancelled" in a["body"] for a in result)
+        mock_db.cancel_reminder.assert_called_once_with("rem-1", CUST)
+
+    async def test_cancel_all_reminders(self, svc, mock_db):
+        """'cancel all reminders' cancels everything."""
+        mock_db.cancel_all_reminders = AsyncMock(return_value=3)
+        result = await svc.process_message(CUST, "cancel all reminders")
+        assert any("Cancelled 3" in a["body"] for a in result)

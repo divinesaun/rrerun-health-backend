@@ -241,27 +241,36 @@ async def get_inventory_item(item_id: str) -> Optional[Dict]:
 # ---------------------------------------------------------------------------
 
 async def search_medicines_with_inventory(medicine_names: List[str]) -> List[Dict]:
-    """Search for medicines by name and include pharmacy inventory info."""
+    """Search for medicines by name (with alias expansion) and include pharmacy inventory info."""
+    from app.utils.medicine_aliases import expand_search_terms
+
     results = []
+    seen_med_ids = set()
     for name in medicine_names:
-        medicines = (
-            supabase.table("medicines")
-            .select("*")
-            .ilike("name", f"%{name}%")
-            .limit(5)
-            .execute()
-        )
-        for med in medicines.data:
-            inventory = (
-                supabase.table("inventory")
-                .select("*, pharmacies(id, name, address, suburb, city, phone, whatsapp_number, opening_hours, rating, total_reviews, has_delivery, accepts_medical_aid, is_24_hours, latitude, longitude, parking_available, website, facebook, instagram, special_services)")
-                .eq("medicine_id", med["id"])
-                .eq("in_stock", True)
-                .order("price")
+        # Expand aliases: "panado" → ["panado", "paracetamol", "tylenol", ...]
+        expanded = expand_search_terms(name)
+        for term in expanded:
+            medicines = (
+                supabase.table("medicines")
+                .select("*")
+                .ilike("name", f"%{term}%")
+                .limit(5)
                 .execute()
             )
-            med["pharmacies"] = inventory.data
-            results.append(med)
+            for med in medicines.data:
+                if med["id"] in seen_med_ids:
+                    continue
+                seen_med_ids.add(med["id"])
+                inventory = (
+                    supabase.table("inventory")
+                    .select("*, pharmacies(id, name, address, suburb, city, phone, whatsapp_number, opening_hours, rating, total_reviews, has_delivery, accepts_medical_aid, is_24_hours, latitude, longitude, parking_available, website, facebook, instagram, special_services)")
+                    .eq("medicine_id", med["id"])
+                    .eq("in_stock", True)
+                    .order("price")
+                    .execute()
+                )
+                med["pharmacies"] = inventory.data
+                results.append(med)
     return results
 
 
@@ -577,6 +586,55 @@ async def add_unverified_medicine(name: str, added_by: str = "") -> Optional[Dic
     except Exception as e:
         logger.error(f"Failed to add unverified medicine '{name}': {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Medication reminder helpers
+# ---------------------------------------------------------------------------
+
+async def create_reminder(data: Dict) -> Dict:
+    result = supabase.table("medication_reminders").insert(data).execute()
+    return result.data[0] if result.data else {}
+
+
+async def list_reminders(customer_id: str, active_only: bool = True) -> List[Dict]:
+    query = (
+        supabase.table("medication_reminders")
+        .select("*")
+        .eq("customer_id", customer_id)
+        .order("reminder_time")
+    )
+    if active_only:
+        query = query.eq("is_active", True)
+    result = query.execute()
+    return result.data
+
+
+async def cancel_reminder(reminder_id: str, customer_id: str) -> bool:
+    result = (
+        supabase.table("medication_reminders")
+        .update({"is_active": False})
+        .eq("id", reminder_id)
+        .eq("customer_id", customer_id)
+        .execute()
+    )
+    return bool(result.data)
+
+
+async def cancel_all_reminders(customer_id: str) -> int:
+    existing = (
+        supabase.table("medication_reminders")
+        .select("id")
+        .eq("customer_id", customer_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    count = len(existing.data) if existing.data else 0
+    if count:
+        supabase.table("medication_reminders").update(
+            {"is_active": False}
+        ).eq("customer_id", customer_id).eq("is_active", True).execute()
+    return count
 
 
 # ---------------------------------------------------------------------------

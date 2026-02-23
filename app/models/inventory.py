@@ -4,14 +4,15 @@ from datetime import datetime
 
 
 class InventoryBase(BaseModel):
-    medicine_id: str
+    medicine_id: Optional[str] = None
     price: float
     in_stock: bool = True
     quantity_available: Optional[str] = "In Stock"
 
 
 class InventoryCreate(InventoryBase):
-    pass
+    medicine_name: Optional[str] = None  # free-text name if medicine_id is not provided
+    category: Optional[str] = None
 
 
 class InventoryUpdate(BaseModel):
