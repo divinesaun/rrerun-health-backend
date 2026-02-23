@@ -25,6 +25,9 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
+# Zimbabwe uses Central Africa Time (UTC+2)
+CAT = timezone(timedelta(hours=2))
+
 from loguru import logger
 
 from app import database as db
@@ -32,9 +35,6 @@ from app.services.stepfun_service import stepfun_service
 from app.services.search_service import search_service
 from app.services.analytics_service import analytics_service
 from app.services.ocr_service import ocr_service
-
-# Zimbabwe is CAT (UTC+2)
-CAT = timezone(timedelta(hours=2))
 
 DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -365,7 +365,9 @@ class WhatsAppService:
         "*What would you like to do?*\n\n"
         "1️⃣ 💊 Find a medicine\n"
         "2️⃣ 📍 Pharmacies near me\n"
-        "3️⃣ 💾 My saved pharmacies\n\n"
+        "3️⃣ 💾 My saved pharmacies\n"
+        "4️⃣ ⏰ My medication reminders\n"
+        "5️⃣ ⭐ Upgrade to Pro\n\n"
         "_Just type a medicine name to get started!_\n"
         "_Reply *0* anytime for this menu_"
     )
@@ -379,6 +381,11 @@ class WhatsAppService:
         "📍 Type *pharmacy [area]* to find nearby\n"
         "⭐ Type *rate 1-5* after viewing a pharmacy\n"
         "💾 Type *save* to bookmark a pharmacy\n\n"
+        "⏰ *Medication Reminders:*\n"
+        "  _remind [medicine] [time]_ — set a reminder\n"
+        "  _reminders_ — view your reminders\n"
+        "  _cancel reminder [number]_ — cancel one\n\n"
+        "⭐ Type *pro* to learn about Pro mode\n\n"
         "_Reply *0* for main menu_"
     )
 
@@ -474,6 +481,12 @@ class WhatsAppService:
             if num == 3 and not results:
                 logger.info(f"[ROUTE] customer={customer_id} path=MENU_3_SAVED (no results)")
                 return await self._show_saved_pharmacies(customer_id)
+            if num == 4 and not results:
+                logger.info(f"[ROUTE] customer={customer_id} path=MENU_4_REMINDERS (no results)")
+                return await self._handle_list_reminders(customer_id)
+            if num == 5 and not results:
+                logger.info(f"[ROUTE] customer={customer_id} path=MENU_5_PRO (no results)")
+                return await self._handle_pro_info(customer_id)
             # Out of range
             if results:
                 logger.info(f"[ROUTE] customer={customer_id} path=NUM_OUT_OF_RANGE num={num} max={len(results)}")
@@ -502,6 +515,12 @@ class WhatsAppService:
         if lower in ("rate",):
             logger.info(f"[ROUTE] customer={customer_id} path=CMD_RATE")
             return await self._show_rating_prompt(customer_id, session)
+        if lower in ("pro", "upgrade", "subscribe", "pro mode"):
+            logger.info(f"[ROUTE] customer={customer_id} path=CMD_PRO")
+            return await self._handle_pro_info(customer_id)
+        if lower.startswith("pay ") or lower.startswith("activate pro"):
+            logger.info(f"[ROUTE] customer={customer_id} path=CMD_PAY input={text[:80]!r}")
+            return await self._handle_pro_payment(customer_id, text)
 
         # ── 10. Rate N [comment] ──
         if lower.startswith("rate "):
@@ -684,7 +703,8 @@ class WhatsAppService:
             return [_text(
                 f"✅ Reminder set!\n\n"
                 f"💊 *{medicine_name}*\n"
-                f"⏰ Every day at *{display_time}*\n\n"
+                f"⏰ Every day at *{display_time} CAT*\n\n"
+                "_All times are Central Africa Time (UTC+2)_\n\n"
                 "_Reply *reminders* to see all your reminders_\n"
                 "_Reply *0* for main menu_"
             )]
@@ -714,7 +734,9 @@ class WhatsAppService:
             t = r.get("reminder_time", "?")
             if isinstance(t, str) and len(t) >= 5:
                 t = t[:5]  # "08:00:00" → "08:00"
-            lines.append(f"{idx}. 💊 *{r.get('medicine_name', '?')}* — {t}")
+            lines.append(f"{idx}. 💊 *{r.get('medicine_name', '?')}* — {t} CAT")
+        lines.append("")
+        lines.append("_All times are Central Africa Time (UTC+2)_")
         lines.append("")
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append("_Cancel one: *cancel reminder [number]*_")
@@ -761,6 +783,87 @@ class WhatsAppService:
         except Exception as e:
             logger.error(f"Failed to cancel reminder for {customer_id}: {e}")
             return [_text("⚠️ Sorry, couldn't cancel that reminder. Please try again.")]
+
+    # ── Pro Mode handlers ─────────────────────────────────────────────────
+
+    async def _handle_pro_info(self, customer_id: str) -> List[dict]:
+        """Show Pro Mode subscription info."""
+        # Check if user already has an active subscription
+        try:
+            customer = await db.get_customer_by_id(customer_id)
+            is_pro = customer.get("is_pro", False) if customer else False
+        except Exception:
+            is_pro = False
+
+        if is_pro:
+            return [_text(
+                "⭐ *RERUN Health Pro — Active*\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Your Pro subscription is active! You have access to:\n\n"
+                "🤖 *AI Chat Mode* — natural conversation instead of menu commands\n"
+                "⏰ *Smart Reminders* — intelligent medication scheduling\n"
+                "📊 *Health Insights* — personalized medicine recommendations\n"
+                "🔔 *Priority Support* — faster pharmacy responses\n\n"
+                "_Reply *0* for main menu_"
+            )]
+
+        return [_text(
+            "⭐ *RERUN Health Pro*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Upgrade to Pro for *$2.99/month* and unlock:\n\n"
+            "🤖 *AI Chat Mode* — talk naturally instead of using menu commands\n"
+            "⏰ *Smart Reminders* — intelligent medication scheduling\n"
+            "📊 *Health Insights* — personalized medicine recommendations\n"
+            "🔔 *Priority Support* — faster pharmacy responses\n\n"
+            "💳 *Pay via EcoCash:*\n"
+            "Type: *pay 0786280681*\n"
+            "or: *activate pro*\n\n"
+            "_Reply *0* for main menu_"
+        )]
+
+    async def _handle_pro_payment(self, customer_id: str, text: str) -> List[dict]:
+        """Handle Pro Mode payment via EcoCash (dummy implementation)."""
+        # Extract phone number if provided: "pay 077..." or "activate pro"
+        phone_match = re.search(r"(07\d{8})", text)
+        payer_phone = phone_match.group(1) if phone_match else None
+
+        logger.info(f"[PRO_PAYMENT] customer={customer_id} payer_phone={payer_phone}")
+
+        # ── DUMMY IMPLEMENTATION ──
+        # In production, this would:
+        # 1. Call EcoCash API: POST https://developers.ecocash.co.zw/api/transactions
+        #    with merchant_number=0786280681, amount=2.99, currency=USD,
+        #    payer_msisdn=payer_phone
+        # 2. Poll for transaction status
+        # 3. On success, update customer record with is_pro=True, pro_expires_at=now+30d
+        # 4. Send confirmation message
+
+        # For now, simulate a successful payment
+        try:
+            pro_expires = datetime.now(timezone.utc) + timedelta(days=30)
+            await db.update_customer(customer_id, {
+                "is_pro": True,
+                "pro_expires_at": pro_expires.isoformat(),
+            })
+            return [_text(
+                "✅ *Pro Mode Activated!*\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "🎉 Welcome to RERUN Health Pro!\n\n"
+                "Your subscription is active until "
+                f"*{pro_expires.strftime('%d %B %Y')}*.\n\n"
+                "🤖 *AI Chat Mode* is now enabled — just type naturally!\n"
+                "⏰ *Smart Reminders* — set reminders with _remind [medicine] [time]_\n\n"
+                f"💳 EcoCash payment of $2.99 to 0786280681"
+                f"{' from ' + payer_phone if payer_phone else ''} (simulated)\n\n"
+                "_Reply *0* for main menu_"
+            )]
+        except Exception as e:
+            logger.error(f"[PRO_PAYMENT] Failed for {customer_id}: {e}")
+            return [_text(
+                "⚠️ Sorry, there was a problem processing your payment.\n\n"
+                "Please try again or contact support.\n\n"
+                "_Reply *0* for main menu_"
+            )]
 
     # Common symptom → OTC suggestion map (shown before searching)
     _SYMPTOM_SUGGESTIONS: dict = {

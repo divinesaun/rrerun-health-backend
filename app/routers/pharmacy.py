@@ -260,32 +260,54 @@ async def update_pharmacy_profile(
 ):
     """Update pharmacy info (hours, contact, etc.)."""
     import json as _json
+    pharmacy_id = current_user["pharmacy_id"]
+    logger.info(f"[PROFILE_UPDATE] pharmacy={pharmacy_id} raw_payload={payload.model_dump()}")
+
     update_data = payload.model_dump(exclude_none=True)
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
+
     # opening_hours is JSONB in DB — ensure it's a dict before saving
     if "opening_hours" in update_data:
         oh = update_data["opening_hours"]
         if isinstance(oh, str):
             try:
-                update_data["opening_hours"] = _json.loads(oh)
+                parsed = _json.loads(oh)
+                if isinstance(parsed, dict):
+                    update_data["opening_hours"] = parsed
             except (_json.JSONDecodeError, TypeError):
-                pass  # keep as-is if not valid JSON
-    # latitude / longitude are numeric in DB — cast strings to float
+                # Not valid JSON — remove to avoid JSONB column error
+                update_data.pop("opening_hours", None)
+                logger.warning(f"[PROFILE_UPDATE] Removed invalid opening_hours string")
+
+    # latitude / longitude — try float first (numeric col), fallback to string (text col)
     for coord_key in ("latitude", "longitude"):
-        if coord_key in update_data and update_data[coord_key] is not None:
-            try:
-                update_data[coord_key] = float(update_data[coord_key])
-            except (ValueError, TypeError):
-                update_data.pop(coord_key)
+        val = update_data.get(coord_key)
+        if val is not None:
+            if isinstance(val, str) and val.strip() == "":
+                update_data.pop(coord_key)  # empty string → skip
+            else:
+                try:
+                    update_data[coord_key] = float(val)
+                except (ValueError, TypeError):
+                    update_data.pop(coord_key)
+
     # Strip empty strings → null for nullable text columns
-    for key in ("phone", "suburb", "city", "email", "whatsapp_number", "chain_name",
-                "special_services", "website", "facebook", "instagram"):
+    for key in ("name", "address", "phone", "suburb", "city", "email",
+                "whatsapp_number", "chain_name", "special_services",
+                "website", "facebook", "instagram"):
         if key in update_data and update_data[key] == "":
             update_data[key] = None
+
+    logger.info(f"[PROFILE_UPDATE] pharmacy={pharmacy_id} cleaned_data_keys={list(update_data.keys())}")
+
     try:
-        pharmacy = await db.update_pharmacy(current_user["pharmacy_id"], update_data)
+        pharmacy = await db.update_pharmacy(pharmacy_id, update_data)
+        if not pharmacy:
+            raise HTTPException(status_code=404, detail="Pharmacy not found or no changes made")
         return {"pharmacy": pharmacy}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Profile update failed for pharmacy {current_user['pharmacy_id']}: {e}")
+        logger.error(f"[PROFILE_UPDATE] FAILED pharmacy={pharmacy_id} error={e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to update profile: {str(e)}")

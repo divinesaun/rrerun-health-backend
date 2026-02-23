@@ -363,9 +363,21 @@ class TestNumberInput:
         result = await svc.process_message(CUST, "5")
         assert any("pick a number from 1 to 1" in a["body"] for a in result)
 
-    async def test_number_4_no_results(self, svc, mock_db):
-        """Path 7f: number > 3, no results → welcome fallback."""
+    async def test_number_4_no_results_shows_reminders(self, svc, mock_db):
+        """Path 7f: '4' with no results → medication reminders."""
+        mock_db.list_reminders = AsyncMock(return_value=[])
         result = await svc.process_message(CUST, "4")
+        assert any("Reminder" in a["body"] for a in result)
+
+    async def test_number_5_no_results_shows_pro(self, svc, mock_db):
+        """Path 7g: '5' with no results → Pro Mode info."""
+        mock_db.get_customer_by_id = AsyncMock(return_value={"is_pro": False})
+        result = await svc.process_message(CUST, "5")
+        assert any("Pro" in a["body"] for a in result)
+
+    async def test_number_6_no_results_welcome(self, svc, mock_db):
+        """Path 7h: number > 5, no results → welcome fallback."""
+        result = await svc.process_message(CUST, "6")
         assert any("Welcome" in a["body"] for a in result)
 
     async def test_number_0_in_digit_branch(self, svc, mock_db):
@@ -1015,3 +1027,86 @@ class TestMedicationReminders:
         mock_db.cancel_all_reminders = AsyncMock(return_value=3)
         result = await svc.process_message(CUST, "cancel all reminders")
         assert any("Cancelled 3" in a["body"] for a in result)
+
+    async def test_cancel_all_reminders_none(self, svc, mock_db):
+        """'cancel all reminders' with none active."""
+        mock_db.cancel_all_reminders = AsyncMock(return_value=0)
+        result = await svc.process_message(CUST, "cancel all reminders")
+        assert any("don't have any" in a["body"] for a in result)
+
+    async def test_cancel_reminder_out_of_range(self, svc, mock_db):
+        """'cancel reminder 5' when only 1 reminder exists."""
+        mock_db.list_reminders = AsyncMock(return_value=[
+            {"id": "rem-1", "medicine_name": "Paracetamol", "reminder_time": "08:00:00"},
+        ])
+        result = await svc.process_message(CUST, "cancel reminder 5")
+        assert any("No reminder #5" in a["body"] for a in result)
+
+    async def test_reminder_with_dot_time(self, svc, mock_db):
+        """'remind Aspirin 9.30am' should parse correctly."""
+        mock_db.create_reminder = AsyncMock(return_value={"id": "rem-3"})
+        result = await svc.process_message(CUST, "remind Aspirin 9.30am")
+        assert any("09:30" in a["body"] for a in result)
+
+    async def test_reminder_time_shows_cat(self, svc, mock_db):
+        """Reminder confirmation should show CAT timezone."""
+        mock_db.create_reminder = AsyncMock(return_value={"id": "rem-4"})
+        result = await svc.process_message(CUST, "remind Ibuprofen 14:00")
+        assert any("CAT" in a["body"] for a in result)
+
+    async def test_reminder_list_shows_cat(self, svc, mock_db):
+        """Reminder list should show CAT timezone label."""
+        mock_db.list_reminders = AsyncMock(return_value=[
+            {"id": "rem-1", "medicine_name": "Test", "reminder_time": "08:00:00"},
+        ])
+        result = await svc.process_message(CUST, "reminders")
+        assert any("CAT" in a["body"] for a in result)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRO MODE
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+class TestProMode:
+
+    async def test_pro_info_not_subscribed(self, svc, mock_db):
+        """'pro' shows subscription info when not subscribed."""
+        mock_db.get_customer_by_id = AsyncMock(return_value={"is_pro": False})
+        result = await svc.process_message(CUST, "pro")
+        body = result[0]["body"]
+        assert "Pro" in body
+        assert "EcoCash" in body
+        assert "0786280681" in body
+
+    async def test_pro_info_already_subscribed(self, svc, mock_db):
+        """'pro' shows active status when already subscribed."""
+        mock_db.get_customer_by_id = AsyncMock(return_value={"is_pro": True})
+        result = await svc.process_message(CUST, "pro")
+        assert any("Active" in a["body"] for a in result)
+
+    async def test_upgrade_command(self, svc, mock_db):
+        """'upgrade' routes to Pro Mode info."""
+        mock_db.get_customer_by_id = AsyncMock(return_value={"is_pro": False})
+        result = await svc.process_message(CUST, "upgrade")
+        assert any("Pro" in a["body"] for a in result)
+
+    async def test_activate_pro_payment(self, svc, mock_db):
+        """'activate pro' triggers dummy payment flow."""
+        mock_db.update_customer = AsyncMock(return_value=None)
+        result = await svc.process_message(CUST, "activate pro")
+        assert any("Pro Mode Activated" in a["body"] for a in result)
+
+    async def test_pay_with_phone(self, svc, mock_db):
+        """'pay 0771234567' extracts phone and processes payment."""
+        mock_db.update_customer = AsyncMock(return_value=None)
+        result = await svc.process_message(CUST, "pay 0771234567")
+        body = " ".join(a["body"] for a in result)
+        assert "0771234567" in body
+        assert "Pro Mode Activated" in body
+
+    async def test_menu_5_shows_pro(self, svc, mock_db):
+        """Menu option 5 shows Pro Mode info."""
+        mock_db.get_customer_by_id = AsyncMock(return_value={"is_pro": False})
+        result = await svc.process_message(CUST, "5")
+        assert any("Pro" in a["body"] for a in result)
